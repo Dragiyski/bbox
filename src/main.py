@@ -1,5 +1,10 @@
-import argparse, sys, pandas, numpy
+import argparse, sys, pandas, numpy, numpy.ma
 from mesh import Mesh
+from PIL import Image
+
+def normalize(v):
+    l = numpy.linalg.norm(v, axis=-1)
+    return v / numpy.expand_dims(l, len(l.shape))
 
 def main():
     numpy.set_printoptions(suppress=True)
@@ -11,6 +16,60 @@ def main():
     args = parser.parse_args()
     mesh = Mesh.from_wavefront_stream(args.file)
     index = MeshIndex(mesh)
+
+    # Camera Setup: 1 per frame, outside GPU
+    pixel_width = 800
+    pixel_height = 600
+    aspect_ratio = pixel_width / pixel_height
+    camera_position = numpy.array([0.5, -2.0, 0.5], dtype=numpy.float32)
+    camera_direction = normalize(-camera_position)
+    world_up = numpy.array([0.0, 0.0, 1.0], dtype=numpy.float32)
+    view_right = normalize(numpy.cross(camera_direction, world_up))
+    view_up = normalize(numpy.cross(view_right, camera_direction))
+    field_of_view = numpy.radians(60)
+    diagonal = numpy.tan(field_of_view * 0.5)
+    screen_height = diagonal / numpy.sqrt(1 + aspect_ratio * aspect_ratio)
+    screen_width = aspect_ratio * screen_height
+    screen_right = screen_width * view_right
+    screen_up = screen_height * view_up
+    screen_center = camera_position + camera_direction
+    ray_origin = camera_position
+
+    # Ray generation: 1 per pixel, in GPU
+    view_pixels = numpy.moveaxis(numpy.mgrid[0:pixel_height, 0:pixel_width], 0, -1).astype(numpy.float32)
+    view_pixels[:, :, 1] = (view_pixels[:, :, 1] + 0.5) / pixel_width
+    view_pixels[:, :, 0] = (view_pixels[:, :, 0] + 0.5) / pixel_height
+    view_pixels[:, :, 0] = 1.0 - view_pixels[:, :, 0]
+    view_pixels = view_pixels * 2.0 - 1.0
+    world_pixels = screen_center + view_pixels[:, :, 0, None] * screen_up + view_pixels[:, :, 1, None] * screen_right
+    ray_direction = normalize(world_pixels - camera_position)
+
+    bounding_box = numpy.vstack([index.nodes[index.root_node]['position_min'], index.nodes[index.root_node]['position_max']])
+    ray_distance = (bounding_box - ray_origin)[None, None] / ray_direction[:, :, None]
+    intersection_points = ray_distance[:, :, :, :, None] * ray_direction[:, :, None, None] + ray_origin
+    bounding_box_size = bounding_box[1] - bounding_box[0]
+    box_ray_quad = (intersection_points - bounding_box[0]) / bounding_box_size
+    for d in range(3):
+        box_ray_quad[:, :, 0, d, d] = 0.0
+        box_ray_quad[:, :, 1, d, d] = 1.0
+    box_intersection = numpy.logical_and(numpy.all(box_ray_quad >= 0.0, axis=-1), numpy.all(box_ray_quad <= 1.0, axis=-1)).reshape(box_ray_quad.shape[0], box_ray_quad.shape[1], -1)
+    has_intersection = numpy.any(box_intersection, axis=-1)
+    
+    box_ray_isect_distance = numpy.ma.array(ray_distance[has_intersection].reshape(-1, 6), mask=numpy.logical_not(box_intersection[has_intersection]))
+    box_ray_isect_side = box_ray_isect_distance.argmin(axis=-1)
+    box_ray_isect_side = numpy.stack([box_ray_isect_side % 3, box_ray_isect_side // 3], axis=-1)
+    box_color = numpy.zeros(shape=(box_ray_isect_side.shape[0], 3), dtype=numpy.float32)
+    box_color[(numpy.arange(box_color.shape[0]), box_ray_isect_side[:, 0])] = box_ray_isect_side[:, 1] * 2.0 - 1.0
+    box_color = box_color * 0.5 + 0.5
+    assert box_ray_isect_side.shape[0] == box_ray_isect_distance.shape[0], 'box_ray_isect_side.shape[0] == box_ray_isect_distance.shape[0]'
+    pass
+    
+    color = numpy.zeros((pixel_height, pixel_width, 3), dtype=numpy.float32)
+    color[has_intersection] = box_color
+    color = (numpy.clip(color, 0.0, 1.0) * 255.0).astype(numpy.uint8)
+    image = Image.fromarray(color)
+    image.show()
+    pass
 
     # sys.stdout.buffer.write(b'\x7fdgi') # Signature
     # sys.stdout.buffer.write(int(1).to_bytes(4, 'little')) # Version
@@ -33,7 +92,7 @@ class MeshIndex2:
 
 
 class MeshIndex:
-    lim = ['min', 'max']
+    _lim = ['min', 'max']
 
     @staticmethod
     def test(*args, **kwargs):
@@ -43,16 +102,6 @@ class MeshIndex:
         triangle_data = pandas.DataFrame(dict([('%d.%s' % (idx, dim), mesh.position.loc[mesh.vertices.loc[mesh.face.loc[1:, idx], 'position'], dim].reset_index(drop=True)) for idx in range(3) for dim in 'xyz']))
         triangle_data.index = mesh.face.index[1:]
         data = pandas.DataFrame(dict([('%s.%s' % (lim, dim), triangle_data[['%d.%s' % (idx, dim) for idx in range(3)]].T.agg(lim)) for lim in ['min', 'max'] for dim in 'xyz']))
-        #mesh_min = mesh.triangles.position[1:].min(axis=1)
-        #esh_max = mesh.triangles.position[1:].max(axis=1)
-        # data = pandas.DataFrame({
-        #     'min.x': mesh_min[:, 0],
-        #     'min.y': mesh_min[:, 1],
-        #     'min.z': mesh_min[:, 2],
-        #     'max.x': mesh_max[:, 0],
-        #     'max.y': mesh_max[:, 1],
-        #     'max.z': mesh_max[:, 2],
-        # })
         data.index = data.index.astype('UInt32')
         self.mesh = mesh
         self.data = pandas.DataFrame({'group': pandas.Series(1, index=data.index, dtype='UInt32')})
@@ -79,7 +128,7 @@ class MeshIndex:
             for dim in 'xyz':
                 affinity_list.loc[affinity_index['min.%s' % dim], 'subgroup.%s' % dim] = 1
                 affinity_list.loc[affinity_index['max.%s' % dim], 'subgroup.%s' % dim] = 2
-            group_overlap = pandas.DataFrame(dict([('%s.%s' % (self.lim[d], dim), minmax_data.loc[affinity_index['%s.%s' % (self.lim[1-d], dim)]].groupby('group')['%s.%s' % (self.lim[d], dim)].agg(self.lim[d])) for d in range(2) for dim in 'xyz']))
+            group_overlap = pandas.DataFrame(dict([('%s.%s' % (self._lim[d], dim), minmax_data.loc[affinity_index['%s.%s' % (self._lim[1-d], dim)]].groupby('group')['%s.%s' % (self._lim[d], dim)].agg(self._lim[d])) for d in range(2) for dim in 'xyz']))
             group_overlap_data = group_overlap.loc[minmax_data['group']].reset_index(drop=True)
             group_overlap_data.index = minmax_data.index
             min_group_overlap = dict([(dim, (minmax_data.loc[affinity_index['min.%s' % dim], 'max.%s' % dim] - group_overlap_data.loc[affinity_index['min.%s' % dim], 'min.%s' % dim])) for dim in 'xyz'])
@@ -118,48 +167,27 @@ class MeshIndex:
             separation_groups, separation_num_index = numpy.unique(separation_index[:, 1:], return_inverse=True, axis=0)
             separation_node_index = new_nodes.loc[list(zip(separation_groups[:, 0], separation_groups[:, 1]))]['node_index'].values
             self.data.loc[separation_data.index, 'group'] = separation_node_index[separation_num_index]
-        # self.nodes.loc[0] = dict([('%s.%s' % (dir, dim), numpy.float32(0.0)) for dir in ['min', 'max'] for dim in 'xyz'] + [('count', numpy.uint32(0)), ('parent_node', numpy.uint32(0)), ('next_sibling', numpy.uint32(0)), ('first_child', numpy.uint32(0))])
-        # self.nodes.index = self.nodes.index.astype('UInt32')
-        # self.export_bbox = self.nodes[['%s.%s' % (dir, dim) for dir in ['min', 'max'] for dim in 'xyz']].sort_index().to_records(index=False)
-        # self.export_triangles = mesh.triangles
-        # self.tree_data = pandas.DataFrame({'parent_node': self.data['group'].values, 'next_sibling': numpy.uint32(0), 'first_child': numpy.uint32(0), 'count': numpy.uint32(1)}, index=self.data.index + len(self.nodes))
-        # self.tree_data['next_sibling'] = self.tree_data.groupby('parent_node')['next_sibling'].transform(lambda g: numpy.hstack([g.index[1:].values, [0]]).astype(numpy.uint32))
-        # pass
-        # How to organize this data?:
-        # - We need to add to self.nodes for leaf nodes an access to triangles.
-        # - We need somehow to separate nodes by type, with bounding boxes handled by one code, while triangles handled by another.
-        # - We need general metadata - max tree depth
-        # How the data would be used?
-        # - Initially a ray is shot once per pixel, this is Width X Height number of jobs
-        # - A job takes a node (initially all jobs pick the root node)
-        # - A job can schedule 0 or more jobs to do after the current job:
-        #   - Newly scheduled jobs must be able to be processed out-of-order and in parallel.
-        #   - Memory must be organized in a structure where:
-        #   - Different kind of jobs would be added with different data size, but still can be accessed in parallel?
-        # Big problem: How to organize the memory?
-        # 1. It must be assumed that the number of types of jobs would be small (256 or 65536 types max)
-        # 2. We can reserve one large amount of memory to hold the buffer (unfortunately, otherwise there is no way to reserve buffer whose size is given by the GPU)
-        # 3. Using rotational buffer as memory: we allocate large enough fixed size buffer (Let's say 1GiB). We can allocate to memory a space in that buffer.
-        # 4. Jobs stored in the memory must contain both source data and space to write the result.
-        # 5. Execution of jobs in memory will write the result in each space within the job, and use atomicAdd to count the number of jobs about to be scheduled, separated by type.
-        # 6. A single shader invocation (1, 1, 1) takes the atomic values, and computes the amount of new memory required for the new jobs (i.e. its position in the memory), and compute the new job size.
-        # 7. A shader invocation with old jobs form copy the old memory and the static data to the new job space.
-        # 8. A single shader invocation (1, 1, 1) "releases" the old space to be reused.
-        # 9. New jobs executes.
-
-        # That is, we need a single buffer. Initial stage will have the following to form uniform data jobs:
-        # A single root node (the same for all pixels);
-        # A pixel/ray data;
-        # Because the root node is the same for all pixels (thus the type is the same), and because we shoot 1 ray (for now) per pixel,
-        # the initial memory space for jobs can be precomputed on the CPU. This can be loaded in the atomic memory.
-
-        # A raytracing job must contain the following:
-        # - A pointer to node
-        # - ray_min_distance
-        # - ray_max_distance
-        # - screen position: x, y
-        # - ray origin: vec3
-        # - ray direction: vec3
+        self.root_node = 1
+        self.nodes.loc[0] = {k: v.type(0) for k, v in self.nodes.dtypes.items()}
+        self.nodes.sort_index(inplace=True)
+        nodes_src = self.nodes.to_records(index=False)
+        nodes_dtype = numpy.dtype([
+            ('position_min', '<3f4'),
+            ('position_max', '<3f4'),
+            ('count', '<u4'),
+            ('parent_node', '<u4'),
+            ('next_sibling', '<u4'),
+            ('first_child', '<u4')
+        ])
+        nodes_dst = numpy.recarray(nodes_src.shape, dtype=nodes_dtype)
+        nodes_dst['position_min'] = numpy.stack((nodes_src['min.x'], nodes_src['min.y'], nodes_src['min.z']), axis=-1)
+        nodes_dst['position_max'] = numpy.stack((nodes_src['max.x'], nodes_src['max.y'], nodes_src['max.z']), axis=-1)
+        nodes_dst['count'] = nodes_src['count']
+        nodes_dst['parent_node'] = nodes_src['parent_node']
+        nodes_dst['next_sibling'] = nodes_src['next_sibling']
+        nodes_dst['first_child'] = nodes_src['first_child']
+        self.nodes = nodes_dst
+        pass
 
 
 if __name__ == '__main__':
