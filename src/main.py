@@ -2,6 +2,14 @@ import argparse, sys, pandas, numpy, numpy.ma
 from mesh import Mesh
 from PIL import Image
 
+job_dtype = numpy.dtype([
+    ('screen_position', '<2u4'),
+    ('node_index', '<u4'),
+    ('ray_origin', '<3f4'),
+    ('ray_direction', '<3f4'),
+    ('ray_range', '<2f4'),
+])
+
 def normalize(v):
     l = numpy.linalg.norm(v, axis=-1)
     return v / numpy.expand_dims(l, len(l.shape))
@@ -44,30 +52,89 @@ def main():
     world_pixels = screen_center + view_pixels[:, :, 0, None] * screen_up + view_pixels[:, :, 1, None] * screen_right
     ray_direction = normalize(world_pixels - camera_position)
 
-    bounding_box = numpy.vstack([index.nodes[index.root_node]['position_min'], index.nodes[index.root_node]['position_max']])
-    ray_distance = (bounding_box - ray_origin)[None, None] / ray_direction[:, :, None]
-    intersection_points = ray_distance[:, :, :, :, None] * ray_direction[:, :, None, None] + ray_origin
-    bounding_box_size = bounding_box[1] - bounding_box[0]
-    box_ray_quad = (intersection_points - bounding_box[0]) / bounding_box_size
+    color_buffer = numpy.zeros((pixel_height, pixel_width, 3), dtype=numpy.float32)
+    depth_buffer = numpy.full((pixel_height, pixel_width), numpy.float32(numpy.inf))
+
+    jobs = numpy.recarray(pixel_width * pixel_height, job_dtype)
+    jobs['screen_position'] = numpy.vstack([numpy.repeat(numpy.arange(pixel_height), pixel_width), numpy.tile(numpy.arange(pixel_width), pixel_height)]).T
+    jobs['node_index'] = 1
+    jobs['ray_origin'] = ray_origin
+    jobs['ray_direction'] = ray_direction.reshape(-1, 3)
+    jobs['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
+
+    bounding_box = numpy.stack([index.nodes[jobs['node_index']]['position_min'], index.nodes[jobs['node_index']]['position_max']], axis=1)
+    ray_distance = (bounding_box - jobs['ray_origin'][:, None]) / jobs['ray_direction'][:, None]
+    box_ray_points = ray_distance[:, :, :, None] * jobs['ray_direction'][:, None, None] + jobs['ray_origin'][:, None, None]
+    box_size = bounding_box[:, 1] - bounding_box[:, 0]
+    box_ray_quad = (box_ray_points - bounding_box[:, 0][:, None, None]) / box_size[:, None, None]
     for d in range(3):
-        box_ray_quad[:, :, 0, d, d] = 0.0
-        box_ray_quad[:, :, 1, d, d] = 1.0
-    box_intersection = numpy.logical_and(numpy.all(box_ray_quad >= 0.0, axis=-1), numpy.all(box_ray_quad <= 1.0, axis=-1)).reshape(box_ray_quad.shape[0], box_ray_quad.shape[1], -1)
+        box_ray_quad[:, 0, d, d] = 0.0
+        box_ray_quad[:, 1, d, d] = 1.0
+    box_intersection = numpy.logical_and(numpy.all(box_ray_quad >= 0.0, axis=-1), numpy.all(box_ray_quad <= 1.0, axis=-1)).reshape(box_ray_quad.shape[0], -1)
     has_intersection = numpy.any(box_intersection, axis=-1)
     
-    box_ray_isect_distance = numpy.ma.array(ray_distance[has_intersection].reshape(-1, 6), mask=numpy.logical_not(box_intersection[has_intersection]))
-    box_ray_isect_side = box_ray_isect_distance.argmin(axis=-1)
-    box_ray_isect_side = numpy.stack([box_ray_isect_side % 3, box_ray_isect_side // 3], axis=-1)
-    box_color = numpy.zeros(shape=(box_ray_isect_side.shape[0], 3), dtype=numpy.float32)
-    box_color[(numpy.arange(box_color.shape[0]), box_ray_isect_side[:, 0])] = box_ray_isect_side[:, 1] * 2.0 - 1.0
+    # box_ray_distance = numpy.ma.array(ray_distance[has_intersection].reshape(-1, 6), mask=numpy.logical_not(box_intersection[has_intersection]))
+    # box_ray_side = box_ray_distance.argmin(axis=-1)
+    # box_ray_side = numpy.stack([box_ray_side % 3, box_ray_side // 3], axis=-1)
+    # box_color = numpy.zeros(shape=(box_ray_side.shape[0], 3), dtype=numpy.float32)
+    # box_color[(numpy.arange(box_color.shape[0]), box_ray_side[:, 0])] = box_ray_side[:, 1] * 2.0 - 1.0
+    # box_color = box_color * 0.5 + 0.5
+    # color_buffer[jobs[has_intersection]['screen_position'][:, 0], jobs[has_intersection]['screen_position'][:, 1]] = box_color
+
+    for _ in range(5):
+        next_jobs = []
+        active_jobs = jobs[has_intersection]
+        # while loop
+        while True:
+            i = len(next_jobs)
+            s = 'next_sibling' if i > 0 else 'first_child'
+            active_job_nodes = index.nodes[active_jobs['node_index']]
+            active_job_mask = active_job_nodes[s] > 0
+            if not numpy.any(active_job_mask):
+                break
+            next_jobs.append(active_jobs[active_job_mask])
+            next_jobs[i]['node_index'] = index.nodes[next_jobs[i]['node_index']][s]
+            active_jobs = next_jobs[i]
+        # Tree nodes will have first_child = 0 when they contain only triangles.
+        # Once the index is finished those should contain raytracing nodes (triangles for now)
+        # So some of the boxes will be skipped for now
+        # when no more jobs, return
+        if len(next_jobs) > 0:
+            jobs = numpy.hstack(next_jobs)
+        else:
+            jobs = numpy.empty((0,), dtype=job_dtype)
+        
+        bounding_box = numpy.stack([index.nodes[jobs['node_index']]['position_min'], index.nodes[jobs['node_index']]['position_max']], axis=1)
+        ray_distance = (bounding_box - jobs['ray_origin'][:, None]) / jobs['ray_direction'][:, None]
+        box_ray_points = ray_distance[:, :, :, None] * jobs['ray_direction'][:, None, None] + jobs['ray_origin'][:, None, None]
+        box_size = bounding_box[:, 1] - bounding_box[:, 0]
+        box_ray_quad = (box_ray_points - bounding_box[:, 0][:, None, None]) / box_size[:, None, None]
+        for d in range(3):
+            box_ray_quad[:, 0, d, d] = 0.0
+            box_ray_quad[:, 1, d, d] = 1.0
+        box_intersection = numpy.logical_and(numpy.all(box_ray_quad >= 0.0, axis=-1), numpy.all(box_ray_quad <= 1.0, axis=-1)).reshape(box_ray_quad.shape[0], -1)
+        has_intersection = numpy.any(box_intersection, axis=-1)
+
+    box_ray_distance = numpy.ma.array(ray_distance[has_intersection].reshape(-1, 6), mask=numpy.logical_not(box_intersection[has_intersection]))
+    box_ray_side = box_ray_distance.argmin(axis=-1)
+    box_ray_distance = box_ray_distance[numpy.arange(box_ray_distance.shape[0]), box_ray_side].data
+
+    active_jobs = jobs[has_intersection]
+    # This is only necessary for python, as pandas is more effective than a loop. In GPU, depth-buffer comparison happens in parallel.
+    # Note: it might need atomics, but atomics are only integers, depth is float.
+    pixel_distance = pandas.DataFrame({'y': active_jobs['screen_position'][:, 0], 'x': active_jobs['screen_position'][:, 1], 'd': box_ray_distance})
+    pixel_depth_resolver = pixel_distance.groupby(['y', 'x'])['d'].idxmin()
+    depth_mask = box_ray_distance[pixel_depth_resolver.values] <= depth_buffer[pixel_depth_resolver.index.get_level_values(0).values, pixel_depth_resolver.index.get_level_values(1).values]
+    pixel_jobs = active_jobs[pixel_depth_resolver.values][depth_mask]
+    box_ray_side = box_ray_side[pixel_depth_resolver.values][depth_mask]
+    box_ray_side = numpy.stack([box_ray_side % 3, box_ray_side // 3], axis=-1)
+    box_color = numpy.zeros(shape=(box_ray_side.shape[0], 3), dtype=numpy.float32)
+    box_color[(numpy.arange(box_color.shape[0]), box_ray_side[:, 0])] = box_ray_side[:, 1] * 2.0 - 1.0
     box_color = box_color * 0.5 + 0.5
-    assert box_ray_isect_side.shape[0] == box_ray_isect_distance.shape[0], 'box_ray_isect_side.shape[0] == box_ray_isect_distance.shape[0]'
-    pass
+    color_buffer[pixel_jobs['screen_position'][:, 0], pixel_jobs['screen_position'][:, 1]] = box_color
     
-    color = numpy.zeros((pixel_height, pixel_width, 3), dtype=numpy.float32)
-    color[has_intersection] = box_color
-    color = (numpy.clip(color, 0.0, 1.0) * 255.0).astype(numpy.uint8)
-    image = Image.fromarray(color)
+    color_buffer = (numpy.clip(color_buffer, 0.0, 1.0) * 255.0).astype(numpy.uint8)
+    image = Image.fromarray(color_buffer)
     image.show()
     pass
 
