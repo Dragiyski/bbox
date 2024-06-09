@@ -4,8 +4,8 @@ from index import MeshIndex
 from PIL import Image
 
 job_dtype = numpy.dtype([
-    ('screen_position', '<2u4'),
-    ('node_index', '<u4'),
+    ('pixel', '<2u4'),
+    ('node', '<u4'),
     ('flags', '<u4'),
     ('ray_origin', '<3f4'),
     ('ray_direction', '<3f4'),
@@ -19,37 +19,169 @@ def normalize(v):
     l = numpy.linalg.norm(v, axis=-1)
     return v / numpy.expand_dims(l, len(l.shape))
 
-class Raytracer:
-    def __init__(self, index: MeshIndex, width=800, height=600, field_of_view=60, camera_position=[0.0, -1.0, 0.0], world_up=[0.0, 0.0, 1.0]):
-        self.camera_position = numpy.array(camera_position, dtype=numpy.float32)
-        if len(self.camera_position.shape) != 1 or self.camera_position.shape[0] != 3:
-            raise ValueError('Option "camera_position" must be 3D vector')
-        self.camera_direction = normalize(-self.camera_position)
-        self.width = width
-        self.height = height
-        self.index = index
+class Data:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
 
+class Raytracer:
+    def __init__(self, index: MeshIndex):
+        self.index = index
+        self.jobs_by_type = { job_type: numpy.empty((0,), dtype=job_dtype) for job_type in numpy.unique(index.nodes['type']) }
+        self.raytrace_per_type = { job_type: 0 for job_type in self.jobs_by_type.keys() }
+
+    @staticmethod
+    def _process_camera_options(aspect_ratio, *, field_of_view=60, camera_position=[0.0, -1.0, 0.0], world_up=[0.0, 0.0, 1.0], camera_direction=None, camera_focus_at=None, **kwargs):
+        camera_position = numpy.array(camera_position, dtype=numpy.float32)
+        if len(camera_position.shape) != 1 or camera_position.shape[0] != 3:
+            raise ValueError('Option "camera_position" must be 3D vector')
+        if camera_direction is None and camera_focus_at is None:
+            camera_focus_at = numpy.zeros((3,), dtype=numpy.float32)
+        if camera_focus_at is not None and camera_direction is not None:
+            raise ValueError('Conflicting options "camera_direction" and "camera_focus_at"')
+        if camera_focus_at is not None:
+            camera_focus_at = numpy.array(camera_focus_at, dtype=numpy.float32)
+            if len(camera_focus_at.shape) != 1 or camera_focus_at.shape[0] != 3:
+                raise ValueError('Option "camera_focus_at" must be 3D vector')
+            camera_direction = camera_focus_at - camera_position
+        if camera_direction is not None:
+            camera_direction = numpy.array(camera_direction, dtype=numpy.float32)
+            if len(camera_direction.shape) != 1 or camera_direction.shape[0] != 3:
+                raise ValueError('Option "camera_direction" must be 3D vector')
+            camera_direction = normalize(camera_direction)
         world_up = numpy.array(world_up, dtype=numpy.float32)
         if len(world_up.shape) != 1 or world_up.shape[0] != 3:
             raise ValueError('Option "world_up" must be 3D vector')
-        world_up = normalize(world_up)
-        view_right = normalize(numpy.cross(self.camera_direction, world_up))
-        view_up = normalize(numpy.cross(view_right, self.camera_direction))
+
 
         diagonal = numpy.tan(numpy.radians(field_of_view) * 0.5)
-        aspect_ratio = self.width / self.height
         screen_height = diagonal / numpy.sqrt(1 + aspect_ratio * aspect_ratio)
-        self.world_screen_width = aspect_ratio * screen_height
-        self.world_screen_right = self.world_screen_width * view_right
-        self.world_screen_up = screen_height * view_up
-        self.world_screen_center = self.camera_position + self.camera_direction
-        self.jobs_by_type = {k: numpy.empty((0,), dtype=job_dtype) for k in numpy.unique(index.nodes['type'])}
+        screen_width = aspect_ratio * screen_height
+
+        world_up = normalize(world_up)
+        view_right = normalize(numpy.cross(camera_direction, world_up))
+        view_up = normalize(numpy.cross(view_right, camera_direction))
+
+        world_screen_up = screen_height * view_up
+        world_screen_right = screen_width * view_right
+        world_screen_center = camera_position + camera_direction
+
+        return Data(
+            position=camera_position,
+            direction=camera_direction,
+            view_up=view_up,
+            view_right=view_right,
+            world_up=world_up,
+            world_screen_up=world_screen_up,
+            world_screen_right=world_screen_right,
+            world_screen_diagonal=diagonal,
+            world_screen_center=world_screen_center,
+            field_of_view=field_of_view,
+            aspect_ratio=aspect_ratio,
+            world_screen_width=screen_width,
+            world_screen_height=screen_height,
+            camera_focus_at=camera_focus_at
+        )
+
+    def screen(self, width=800, height=600, **kwargs):
+        camera = self._process_camera_options(width / height, **kwargs)
+        self.color_buffer = numpy.zeros((height, width, 3), dtype=numpy.float32)
+        self.depth_buffer = numpy.full((height, width), numpy.float32(numpy.inf))
+
+        view_pixels = numpy.moveaxis(numpy.mgrid[0:height, 0:width], 0, -1).astype(numpy.float32)
+        view_pixels[:, :, 1] = (view_pixels[:, :, 1] + 0.5) / width
+        view_pixels[:, :, 0] = (view_pixels[:, :, 0] + 0.5) / height
+        view_pixels[:, :, 0] = 1.0 - view_pixels[:, :, 0]
+        view_pixels = view_pixels * 2.0 - 1.0
+        world_pixels = camera.world_screen_center + view_pixels[:, :, 0, None] * camera.world_screen_up + view_pixels[:, :, 1, None] * camera.world_screen_right
+        ray_direction = normalize(world_pixels - camera.position)
+
+        self.jobs_by_type[1] = numpy.recarray(width * height, job_dtype)
+        self.jobs_by_type[1]['pixel'] = numpy.vstack([numpy.repeat(numpy.arange(height), width), numpy.tile(numpy.arange(width), height)]).T
+        self.jobs_by_type[1]['node'] = self.index.root_node
+        self.jobs_by_type[1]['ray_origin'] = camera.position
+        self.jobs_by_type[1]['ray_direction'] = ray_direction.reshape(-1, 3)
+        self.jobs_by_type[1]['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
+
+        # self.color_buffer[self.jobs_by_type[1]['pixel'][:, 0], self.jobs_by_type[1]['pixel'][:, 1]] = self.jobs_by_type[1]['ray_direction'] * 0.5 + 0.5
+
+        self.raytrace(**kwargs)
+    
+    def pixel(self, x, y, width=800, height=600, **kwargs):
+        if x <= 0 or x >= width or y <= 0 or y >= height:
+            raise ValueError('Invald pixel coordinates, expected (x, y) within (width, height)')
+        
+        camera = self._process_camera_options(width / height, **kwargs)
+        self.color_buffer = numpy.zeros((1, 1, 3), dtype=numpy.float32)
+        self.depth_buffer = numpy.full((1, 1), numpy.float32(numpy.inf))
+
+        view_pixels = numpy.array([y, x], dtype=numpy.float32)[None]
+        view_pixels[:, 1] = (view_pixels[:, 1] + 0.5) / width
+        view_pixels[:, 0] = (view_pixels[:, 0] + 0.5) / height
+        view_pixels[:, 0] = 1.0 - view_pixels[:, 0]
+        view_pixels = view_pixels * 2.0 - 1.0
+        world_pixels = camera.world_screen_center + view_pixels[:, 0, None] * camera.world_screen_up + view_pixels[:, 1, None] * camera.world_screen_right
+        ray_direction = normalize(world_pixels - camera.position)
+
+        self.jobs_by_type[1] = numpy.recarray((1,), job_dtype)
+        self.jobs_by_type[1]['pixel'][0] = [0, 0]
+        self.jobs_by_type[1]['node'][0] = self.index.root_node
+        self.jobs_by_type[1]['ray_origin'][0] = camera.position
+        self.jobs_by_type[1]['ray_direction'] = ray_direction.reshape(-1, 3)
+        self.jobs_by_type[1]['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
+
+        ray_origin = camera.position
+        ray_direction = ray_direction[0]
+
+        T = self.index.database[2][1:]['position']
+        T_edges = T[:, [1, 2, 0]] - T
+        T_normal = normalize(numpy.cross(T_edges[:, 0], T_edges[:, 1]))
+        T_plane_factor = numpy.einsum('ab,ab->a', T_normal, T[:, 0])
+        T_distance = numpy.einsum('ab,ab->a', T_normal, (T_plane_factor[:, None] - ray_origin)) / numpy.dot(T_normal, ray_direction)
+        T_point = ray_origin + T_distance[:, None] * ray_direction
+        T_inner = T_point[:, None] - T
+        T_trig_intersection = numpy.stack([numpy.einsum('ab,ab->a', T_normal, numpy.cross(T_edges[:, i], T_inner[:, i])) for i in range(3)], axis=-1)
+        T_has_intersection = numpy.all(T_trig_intersection >= 0.0, axis=-1)
+        v0 = T[:, 1] - T[:, 0]
+        v1 = T[:, 2] - T[:, 0]
+        v2 = T_point - T[:, 0]
+        dot00 = numpy.einsum('ab,ab->a', v0, v0)
+        dot01 = numpy.einsum('ab,ab->a', v0, v1)
+        dot02 = numpy.einsum('ab,ab->a', v0, v2)
+        dot11 = numpy.einsum('ab,ab->a', v1, v1)
+        dot12 = numpy.einsum('ab,ab->a', v1, v2)
+        inv_denom = 1.0 / (dot00 * dot11 - dot01 * dot01)
+        u = (dot11 * dot02 - dot01 * dot12) * inv_denom
+        v = (dot00 * dot12 - dot01 * dot02) * inv_denom
+        w = 1 - u - v
+        barycentric = numpy.stack([u, v, w], axis=-1)
+
+        # For some reason only triangle 34 intersects
+        # Node path: 288, 246, 93, 31, 10, 3, 1, 0
+
+        pass
+
+        self.raytrace(**kwargs)
+
+    
+    def raytrace(self, max_level=None, draw_jobs=True, **kwargs):
+        if max_level is None:
+            max_level = self.index.depth
+        for _ in range(max_level):
+            self.raytrace_per_type[1] += self.jobs_by_type[1].shape[0]
+            self.intersect_bounding_box()
+            self.schedule_children()
+
+        self.raytrace_per_type[2] += self.jobs_by_type[2].shape[0]
+        self.insersect_triangles()
+        if draw_jobs:
+            self.draw_jobs()
+
 
     def intersect_bounding_box(self):
         jobs = self.jobs_by_type[1]
         if jobs.shape[0] <= 0:
             return
-        bounding_box = self.index.database[1][jobs['node_index']]
+        bounding_box = self.index.database[1][jobs['node']]
         ray_distance = (bounding_box - jobs['ray_origin'][:, None]) / jobs['ray_direction'][:, None]
         box_ray_points = ray_distance[:, :, :, None] * jobs['ray_direction'][:, None, None] + jobs['ray_origin'][:, None, None]
         box_size = bounding_box[:, 1] - bounding_box[:, 0]
@@ -107,29 +239,19 @@ class Raytracer:
         # 2. It does not seem to be related to the bounding box epsilon mismatch.
         # 3. This work quite differntly from the stack version, in the stack version the dot(cross(Edge, Point - Opposite Vertex), Normal)
         # seems to provide with something that sums up to 1.0, but here barycentric items do not sum to 1.0.
-        triangles = self.index.database[2][self.index.nodes[jobs['node_index']]['ref']]['position']
-        triangle_normal = normalize(numpy.cross(triangles[:, 2] - triangles[:, 0], triangles[:, 1] - triangles[:, 0]))
+        triangles = self.index.database[2][self.index.nodes[jobs['node']]['ref']]['position']
+        triangle_edges = triangles[:, [1, 2, 0]] - triangles
+        triangle_normal = normalize(numpy.cross(triangle_edges[:, 2], triangle_edges[:, 0]))
         # triangle_normal_degenerate_mask = numpy.abs(numpy.repeat(numpy.float32(1.0), 3) / triangle_normal) < epsilon
         plane_distance = (numpy.einsum('ab,ab->a', triangle_normal, triangles[:, 0]) - numpy.einsum('ab,ab->a', triangle_normal, jobs['ray_origin'])) / numpy.einsum('ab,ab->a', triangle_normal, jobs['ray_direction'])
         ray_range_mask = numpy.logical_and(plane_distance >= jobs['ray_range'][:, 0], plane_distance <= jobs['ray_range'][:, 1])
         plane_point = jobs['ray_origin'] + plane_distance[:, None] * jobs['ray_direction']
-        
-        barycentric = numpy.stack([
-            numpy.einsum('ab,ab->a', numpy.cross(triangles[:, 1] - triangles[:, 2], plane_point - triangles[:, 2]), triangle_normal),
-            numpy.einsum('ab,ab->a', numpy.cross(triangles[:, 2] - triangles[:, 0], plane_point - triangles[:, 0]), triangle_normal),
-            numpy.einsum('ab,ab->a', numpy.cross(triangles[:, 0] - triangles[:, 1], plane_point - triangles[:, 1]), triangle_normal)
-        ], axis=-1)
-        test_barycentry = numpy.stack([
-            numpy.einsum('ab,ab->a', numpy.cross(normalize(triangles[:, 1] - triangles[:, 2]), normalize(plane_point - triangles[:, 2])), triangle_normal),
-            numpy.einsum('ab,ab->a', numpy.cross(normalize(triangles[:, 2] - triangles[:, 0]), normalize(plane_point - triangles[:, 0])), triangle_normal),
-            numpy.einsum('ab,ab->a', numpy.cross(normalize(triangles[:, 0] - triangles[:, 1]), normalize(plane_point - triangles[:, 1])), triangle_normal),
-        ], axis=-1)
-        barycentric = numpy.sign(barycentric.sum(axis=-1))[:, None] * barycentric
+        triangle_inner = plane_point[:, None] - triangles
+        barycentric = numpy.stack([numpy.einsum('ab,ab->a', triangle_normal, numpy.cross(triangle_edges[:, i], triangle_inner[:, i])) for i in range(3)], axis=-1)
         has_intersection = numpy.all(barycentric >= 0.0, axis=-1)
         jobs['flags'] = has_intersection
         jobs['ray_range'] = plane_distance[:, None]
         jobs['normal'] = ((numpy.einsum('ab,ab->a', triangle_normal, -jobs['ray_direction']) >= 0.0).astype(numpy.float32) * 2.0 - 1.0)[:, None] * triangle_normal
-
         return
 
         normal_factor = numpy.sign(numpy.einsum('ij,ij->i', -jobs['ray_direction'], triangle_normal))
@@ -170,20 +292,20 @@ class Raytracer:
         jobs = numpy.hstack(list(self.jobs_by_type.values()))
         active_job_mask = (jobs['flags'] & 1).astype(bool)
         active_jobs = jobs[active_job_mask]
-        pixel_distance = pandas.DataFrame({'y': active_jobs['screen_position'][:, 0], 'x': active_jobs['screen_position'][:, 1], 'd': active_jobs['ray_range'][:, 0]})
+        pixel_distance = pandas.DataFrame({'y': active_jobs['pixel'][:, 0], 'x': active_jobs['pixel'][:, 1], 'd': active_jobs['ray_range'][:, 0]})
         pixel_depth_resolver = pixel_distance.groupby(['y', 'x'])['d'].idxmin()
         depth_mask = active_jobs['ray_range'][pixel_depth_resolver.values, 0] <= self.depth_buffer[pixel_depth_resolver.index.get_level_values(0).values, pixel_depth_resolver.index.get_level_values(1).values]
         pixel_jobs = active_jobs[pixel_depth_resolver.values][depth_mask]
-        # self.color_buffer[active_jobs['screen_position'][:, 0], active_jobs['screen_position'][:, 1]] = active_jobs['normal'] * 0.5 + 0.5
-        self.color_buffer[pixel_jobs['screen_position'][:, 0], pixel_jobs['screen_position'][:, 1]] = pixel_jobs['normal'] * 0.5 + 0.5
-        # self.depth_buffer[active_jobs['screen_position'][:, 0], active_jobs['screen_position'][:, 1]] = active_jobs['ray_range'][:, 0]
-        self.depth_buffer[pixel_jobs['screen_position'][:, 0], pixel_jobs['screen_position'][:, 1]] = pixel_jobs['ray_range'][:, 0]
+        # self.color_buffer[active_jobs['pixel'][:, 0], active_jobs['pixel'][:, 1]] = active_jobs['normal'] * 0.5 + 0.5
+        self.color_buffer[pixel_jobs['pixel'][:, 0], pixel_jobs['pixel'][:, 1]] = pixel_jobs['normal'] * 0.5 + 0.5
+        # self.depth_buffer[active_jobs['pixel'][:, 0], active_jobs['pixel'][:, 1]] = active_jobs['ray_range'][:, 0]
+        self.depth_buffer[pixel_jobs['pixel'][:, 0], pixel_jobs['pixel'][:, 1]] = pixel_jobs['ray_range'][:, 0]
         pass
 
     def schedule_children(self):
         next_jobs = []
         # jobs = numpy.hstack(list(self.jobs_by_type.values()))
-        # numpy.argwhere(numpy.logical_and(jobs['screen_position'][:, 0] == 240, jobs['screen_position'][:, 1] == 440))
+        # numpy.argwhere(numpy.logical_and(jobs['pixel'][:, 0] == 240, jobs['pixel'][:, 1] == 440))
         # pixel 440, 240 must be present
         active_job_mask = (self.jobs_by_type[1]['flags'] & 1).astype(bool)
         active_jobs = self.jobs_by_type[1][active_job_mask]
@@ -191,12 +313,12 @@ class Raytracer:
         while True:
             i = len(next_jobs)
             s = 'next_sibling' if i > 0 else 'first_child'
-            active_job_nodes = self.index.nodes[active_jobs['node_index']]
+            active_job_nodes = self.index.nodes[active_jobs['node']]
             node_mask = active_job_nodes[s] > 0
             if not numpy.any(node_mask):
                 break
             next_jobs.append(active_jobs[node_mask])
-            next_jobs[i]['node_index'] = self.index.nodes[next_jobs[i]['node_index']][s]
+            next_jobs[i]['node'] = self.index.nodes[next_jobs[i]['node']][s]
             active_jobs = next_jobs[i]
         # Tree nodes will have first_child = 0 when they contain only triangles.
         # Once the index is finished those should contain raytracing nodes (triangles for now)
@@ -208,7 +330,7 @@ class Raytracer:
             jobs = numpy.empty((0,), dtype=job_dtype)
         self.jobs_by_type[1] = numpy.empty((0,), dtype=job_dtype)
         for t in self.jobs_by_type.keys():
-            type_mask = self.index.nodes[jobs['node_index']]['type'] == t
+            type_mask = self.index.nodes[jobs['node']]['type'] == t
             new_jobs_by_type = jobs[type_mask]
             if len(new_jobs_by_type) > 0:
                 self.jobs_by_type[t] = numpy.hstack([self.jobs_by_type[t], new_jobs_by_type])
@@ -222,12 +344,12 @@ class Raytracer:
 
         # This is only necessary for python, as pandas is more effective than a loop. In GPU, depth-buffer comparison happens in parallel.
         # Note: it might need atomics, but atomics are only integers, depth is float.
-        pixel_distance = pandas.DataFrame({'y': active_jobs['screen_position'][:, 0], 'x': active_jobs['screen_position'][:, 1], 'd': box_ray_distance})
+        pixel_distance = pandas.DataFrame({'y': active_jobs['pixel'][:, 0], 'x': active_jobs['pixel'][:, 1], 'd': box_ray_distance})
         pixel_depth_resolver = pixel_distance.groupby(['y', 'x'])['d'].idxmin()
         depth_mask = box_ray_distance[pixel_depth_resolver.values] <= self.depth_buffer[pixel_depth_resolver.index.get_level_values(0).values, pixel_depth_resolver.index.get_level_values(1).values]
         pixel_jobs = active_jobs[pixel_depth_resolver.values][depth_mask]
-        self.color_buffer[pixel_jobs['screen_position'][:, 0], pixel_jobs['screen_position'][:, 1]] = pixel_jobs['normal'] * 0.5 + 0.5
-        self.depth_buffer[pixel_jobs['screen_position'][:, 0], pixel_jobs['screen_position'][:, 1]] = box_ray_distance[pixel_depth_resolver.values][depth_mask]
+        self.color_buffer[pixel_jobs['pixel'][:, 0], pixel_jobs['pixel'][:, 1]] = pixel_jobs['normal'] * 0.5 + 0.5
+        self.depth_buffer[pixel_jobs['pixel'][:, 0], pixel_jobs['pixel'][:, 1]] = box_ray_distance[pixel_depth_resolver.values][depth_mask]
 
     def display_color_buffer(self):
         color_buffer = (numpy.clip(self.color_buffer, 0.0, 1.0) * 255.0).astype(numpy.uint8)
@@ -248,8 +370,8 @@ class Raytracer:
         ray_direction = normalize(world_pixels - ray_origin)
 
         self.jobs_by_type[1] = numpy.recarray(self.width * self.height, job_dtype)
-        self.jobs_by_type[1]['screen_position'] = numpy.vstack([numpy.repeat(numpy.arange(self.height), self.width), numpy.tile(numpy.arange(self.width), self.height)]).T
-        self.jobs_by_type[1]['node_index'] = 1
+        self.jobs_by_type[1]['pixel'] = numpy.vstack([numpy.repeat(numpy.arange(self.height), self.width), numpy.tile(numpy.arange(self.width), self.height)]).T
+        self.jobs_by_type[1]['node'] = 1
         self.jobs_by_type[1]['ray_origin'] = ray_origin
         self.jobs_by_type[1]['ray_direction'] = ray_direction.reshape(-1, 3)
         self.jobs_by_type[1]['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
@@ -276,8 +398,20 @@ def main():
     mesh = Mesh.from_wavefront_stream(args.file)
     index = MeshIndex(mesh)
 
-    raytracer = Raytracer(index, camera_position=[0.5, -2.0, 0.5])
-    raytracer.run()
+    raytracer = Raytracer(index)
+
+    raytracer.screen(800, 600, camera_position=[1.4, -1.4, 0.75], max_level=None)
+    raytracer.display_color_buffer()
+    print('Raytrace Results:')
+    print(' - Raytrace per type: %r' % raytracer.raytrace_per_type)
+
+    #TODO: WARNING: Something is wrong with the index.
+    # With the above parameters, intersecting all triangles gives one triangle: 34 (it is closed shape, it should intersect 2?)
+    # Even with that tracing the triangle, the path is 288 -> 246 -> 93 -> 31 -> 10 -> 3 -> 1
+    # While 288 parent_node is 246, 246 has no child 288. First child: 272, next sibling: 675, next sibling: 652, next sibling: 0
+    # raytracer.pixel(x=440, y=256, width=800, height=600, camera_position=[1.2, -3.0, 2.5], max_level=None)
+    # print(raytracer.color_buffer)
+    # print(raytracer.depth_buffer)
 
 if __name__ == '__main__':
     sys.exit(main())

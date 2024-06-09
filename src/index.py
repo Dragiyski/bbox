@@ -83,12 +83,12 @@ class MeshIndex:
 
         self.data['index'] = self.data.index
         self.data.index += len(self.nodes) - 1
+        self.data.sort_values(['group', 'index'], inplace=True)
         data_first_child = self.data.groupby('group').head(1)
         self.nodes.loc[data_first_child['group'], 'first_child'] = data_first_child.index
         self.data.rename(columns={'group': 'parent_node'}, inplace=True)
         self.data['first_child'] = numpy.uint32(0)
         self.data['next_sibling'] = numpy.uint32(0)
-        self.data.sort_values('parent_node', inplace=True)
         data_node_groups = self.data.groupby('parent_node')
         self.data.loc[data_node_groups.head(-1).index, 'next_sibling'] = data_node_groups.tail(-1).index
         self.data['count'] = numpy.uint32(1)
