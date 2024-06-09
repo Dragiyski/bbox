@@ -411,12 +411,33 @@ def main():
     print('Bulding Index...', file=sys.stderr)
     index = MeshIndex(mesh)
 
+    sys.stdout.buffer.write(b'\x7fd3i') # Identifier of the file
+    # 0x7F is not valid text ASCII (ASCII DEL), thus this file is binary
+    # d3i = dragiyski 3D index
+    sys.stdout.buffer.write((0).to_bytes(2, 'little')) # Version major = all prototypes will have 0, once this is ready for production, it will become > 0
+    sys.stdout.buffer.write((1).to_bytes(2, 'little')) # Version minor = 1 - our first version
+    sys.stdout.buffer.write((2).to_bytes(4, 'little')) # Number of databases excluding the NULL database (i.e. 1-indexed, so last database is 2)
+    sys.stdout.buffer.write(index.nodes.shape[0].to_bytes(4, 'little')) # Number of nodes in the combined index
+    for i in range(1, len(index.database)):
+        sys.stdout.buffer.write(index.database[i].shape[0].to_bytes(4, 'little')) # Number of entries in the database
+        # TODO: Store the format of entries of the database in OpenGL like compatible format, like:
+        # Data Type: Float32, Float64, Int64, UInt64, Int32, UInt32, Int16, UInt16, Int8, UInt8
+        # Data Dims: Supported 1, 2, 3, 4
+        # Data Dim2 maybe? = 1 for vectors, 2, 3, 4 for matrices
+        # Data Stride = number of bytes per items (the distance between this attribute offset and this attribute offset in the next item)
+    
+    for i in range(1, len(index.database)):
+        sys.stdout.buffer.write(index.database[i].tobytes())
+
+    sys.stdout.buffer.write(index.nodes.tobytes())
+
+
     raytracer = Raytracer(index)
 
-    raytracer.screen(800, 600, camera_position=[4, -4, 4], max_level=None)
-    raytracer.display_color_buffer()
-    print('Raytrace Results:')
-    print(' - Raytrace per type: %r' % raytracer.raytrace_per_type)
+    # raytracer.screen(800, 600, camera_position=[4, -4, 4], max_level=None)
+    # raytracer.display_color_buffer()
+    # print('Raytrace Results:')
+    # print(' - Raytrace per type: %r' % raytracer.raytrace_per_type)
 
     #TODO: WARNING: Something is wrong with the index.
     # With the above parameters, intersecting all triangles gives one triangle: 34 (it is closed shape, it should intersect 2?)

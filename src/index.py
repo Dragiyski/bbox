@@ -1,4 +1,4 @@
-import numpy, pandas
+import numpy, pandas, sys
 from mesh import Mesh
 
 class MeshIndex:
@@ -29,6 +29,7 @@ class MeshIndex:
             large_group_count = group_count[group_count > 6]
             if len(large_group_count) <= 0:
                 break
+            print(f'[index]: level={_}...', file=sys.stderr)
             large_group_mask = affinity_list['group'].isin(large_group_count.index)
             minmax_data = self.data[large_group_mask]
             affinity_list = affinity_list[large_group_mask]
@@ -45,7 +46,7 @@ class MeshIndex:
             max_group_overlap = dict([(dim, (group_overlap_data.loc[affinity_index['max.%s' % dim], 'max.%s' % dim] - minmax_data.loc[affinity_index['max.%s' % dim], 'min.%s' % dim])) for dim in 'xyz'])
             group_overlap = pandas.DataFrame(dict([(dim, pandas.concat([min_group_overlap[dim], max_group_overlap[dim]], axis=0)) for dim in 'xyz']))
             group_overlap['group'] = affinity_list['group']
-            group_overlap_count = pandas.DataFrame(dict([(dim, group_overlap[group_overlap[dim] >= 0].groupby('group')[dim].agg('count').astype('UInt32')) for dim in 'xyz']))
+            group_overlap_count = pandas.DataFrame(dict([(dim, group_overlap[group_overlap[dim] >= 0].groupby('group')[dim].agg('count').astype('UInt32')) for dim in 'xyz']), index=group_overlap.groupby('group').groups.keys())
             group_overlap_count.fillna(0, inplace=True)
             group_overlap_count.columns = range(3)
             split_dim = group_overlap_count.idxmin(axis=1)
@@ -77,9 +78,13 @@ class MeshIndex:
             separation_groups, separation_num_index = numpy.unique(separation_index[:, 1:], return_inverse=True, axis=0)
             separation_node_index = new_nodes.loc[list(zip(separation_groups[:, 0], separation_groups[:, 1]))]['node_index'].values
             self.data.loc[separation_data.index, 'group'] = separation_node_index[separation_num_index]
+            print(f'[index] level={_}, nodes={len(self.nodes)}', file=sys.stderr)
+        print('[index] Index complete, total nodes: %d' % len(self.nodes), file=sys.stderr)
         self.root_node = 1
         self.nodes.loc[0] = {k: v.type(0) for k, v in self.nodes.dtypes.items()}
         self.nodes.sort_index(inplace=True)
+
+        print(f'[index] Creating nodes for {len(self.data)} triangles...', file=sys.stderr)
 
         self.data['index'] = self.data.index
         self.data.index += len(self.nodes) - 1
@@ -93,7 +98,6 @@ class MeshIndex:
         self.data.loc[data_node_groups.head(-1).index, 'next_sibling'] = data_node_groups.tail(-1).index
         self.data['count'] = numpy.uint32(1)
         self.data.sort_index(inplace=True)
-        pass
 
         nodes_src = self.nodes.to_records(index=False)
         nodes_dtype = numpy.dtype([
@@ -130,4 +134,4 @@ class MeshIndex:
         trig_nodes['reserved1'] = trig_nodes['reserved2'] = 0
         self.nodes = numpy.hstack([bbox_nodes, trig_nodes])
         del self.data
-        pass
+        print(f'[index] Done!', file=sys.stderr)
