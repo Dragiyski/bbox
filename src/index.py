@@ -1,137 +1,121 @@
 import numpy, pandas, sys
 from mesh import Mesh
+from logger import NullLogger
+
+lims = ['min', 'max']
+
+def init_row(data, columns, dtypes):
+    assert len(dtypes) == len(columns), 'len(dtypes) == len(columns)'
+    return dict([(column, pandas.Series(data[column] if column in data else None, name=column, dtype=dtypes[i])) for i, column in enumerate(columns)])
 
 class MeshIndex:
-    _lim = ['min', 'max']
+    node_dtype = numpy.dtype({
+        'names': ['type', 'ref', 'size', 'parent_node', 'first_child', 'next_sibling'],
+        'formats': ['<u4', '<u4', '<u4', '<u4', '<u4', '<u4'],
+        'offsets': numpy.arange(6) * 4,
+        'itemsize': 8 * 4
+    })
 
-    @staticmethod
-    def test(*args, **kwargs):
-        return None
+    def __init__(self, mesh: Mesh, *, logger=NullLogger(), bounding_box_type = 1, triangle_type = 2):
+        logger.log('[indexing]: initializing(triangles=%d)' % len(mesh.triangles[1:]))
+        self.database = {
+            triangle_type: mesh.triangles,
+            bounding_box_type: numpy.ndarray((mesh.triangles.shape[0] * 2 + 1, 2, 3), dtype=numpy.float32)
+        }
+        self.database[bounding_box_type][0, 0] = [-numpy.inf] * 3
+        self.database[bounding_box_type][0, 1] = [numpy.inf] * 3
+        triangle_minmax = numpy.stack([mesh.triangles[1:]['position'].min(axis=1), mesh.triangles[1:]['position'].max(axis=1)], axis=-2)
+        self.database[bounding_box_type][1:1+triangle_minmax.shape[0]] = triangle_minmax
+        bounding_box_count = 1 + triangle_minmax.shape[0]
+        self.nodes = numpy.recarray((triangle_minmax.shape[0] * 2 + 1,), dtype=self.node_dtype)
+        self.nodes[0] = tuple([0] * len(self.node_dtype.names))
+        self.nodes['parent_node'] = 0
+        self.nodes['first_child'] = 0
+        self.nodes['next_sibling'] = 0
+        self.nodes['type'][1:1+triangle_minmax.shape[0]] = triangle_type
+        self.nodes['ref'][1:1+triangle_minmax.shape[0]] = numpy.arange(triangle_minmax.shape[0]) + 1
+        self.nodes['size'][1:1+triangle_minmax.shape[0]] = 1
+        root_node = node_count = 1 + triangle_minmax.shape[0] 
+        self.nodes[root_node] = tuple([bounding_box_type, bounding_box_count, triangle_minmax.shape[0], 0, 0, 0])
+        node_count += 1
+        self.database[bounding_box_type][bounding_box_count] = numpy.vstack([triangle_minmax[:, 0].min(axis=0), triangle_minmax[:, 1].max(axis=0)])
+        bounding_box_count += 1
 
-    def __init__(self, mesh: Mesh):
-        triangle_data = pandas.DataFrame(dict([('%d.%s' % (idx, dim), mesh.position.loc[mesh.vertices.loc[mesh.face.loc[1:, idx], 'position'], dim].reset_index(drop=True)) for idx in range(3) for dim in 'xyz']))
-        triangle_data.index = mesh.face.index[1:]
-        data = pandas.DataFrame(dict([('%s.%s' % (lim, dim), triangle_data[['%d.%s' % (idx, dim) for idx in range(3)]].T.agg(lim)) for lim in ['min', 'max'] for dim in 'xyz']))
-        data.index = data.index.astype('UInt32')
-        self.mesh = mesh
-        self.data = pandas.DataFrame({'group': pandas.Series(1, index=data.index, dtype='UInt32')})
-        self.data[data.columns] = data
-        self.nodes = pandas.DataFrame(dict([('%s.%s' % (dir, dim), data['%s.%s' % (dir, dim)].agg(dir)) for dir in ['min', 'max'] for dim in 'xyz' ] + [('count', pandas.Series([len(data)], dtype='UInt32', index=[1]))]), index=pandas.Index([1], name='group'))
-        self.nodes['parent_node'] = self.nodes['next_sibling'] = self.nodes['first_child'] = pandas.Series(0, dtype='UInt32', index=self.nodes.index)
+        grouping = pandas.DataFrame({
+            'group': pandas.Series(root_node, dtype='UInt32', index=numpy.arange(triangle_minmax.shape[0]) + 1),
+            'affinity.x': pandas.Series(dtype='Float32'),
+            'affinity.y': pandas.Series(dtype='Float32'),
+            'affinity.z': pandas.Series(dtype='Float32'),
+            'subgroup': pandas.Series(dtype='UInt32'),
+            'subgroup.x': pandas.Series(dtype='UInt32'),
+            'subgroup.y': pandas.Series(dtype='UInt32'),
+            'subgroup.z': pandas.Series(dtype='UInt32'),
+            'overlap': pandas.Series(dtype='Float32'),
+            'overlap.x': pandas.Series(dtype='Float32'),
+            'overlap.y': pandas.Series(dtype='Float32'),
+            'overlap.z': pandas.Series(dtype='Float32'),
+            'ref': pandas.Series(numpy.arange(triangle_minmax.shape[0]) + 1, dtype='UInt32', index=numpy.arange(triangle_minmax.shape[0]) + 1)
+        } | dict([('%s.%s' % (lim, dim), pandas.Series(triangle_minmax[:, ilim, idim], dtype='Float32', index=numpy.arange(triangle_minmax.shape[0]) + 1)) for ilim, lim in enumerate(lims) for idim, dim in enumerate('xyz')]), index=numpy.arange(triangle_minmax.shape[0]) + 1)
+        grouping.index.name = 'index'
         self.depth = 0
-        for _ in range(int(numpy.ceil(numpy.log2(len(self.data))))):
+        for level in range(int(numpy.ceil(numpy.log2(len(triangle_minmax))))):
             self.depth += 1
-            node_list = self.nodes.loc[self.data['group']].reset_index(drop=True)
-            node_list.index = self.data.index
-            affinity_list = pandas.DataFrame(dict([('group', self.data['group'])] + [('subgroup.%s' % dim, numpy.uint32(0)) for dim in 'xyz'] + [('affinity.%s' % dim, (self.data['min.%s' % dim] + self.data['max.%s' % dim]) - (node_list['min.%s' % dim] + node_list['max.%s' % dim])) for dim in 'xyz']))
-            
-            group_count = affinity_list.groupby('group')['group'].agg('count')
-            large_group_count = group_count[group_count > 6]
-            if len(large_group_count) <= 0:
+            group_count = grouping.groupby('group', sort=False)['group'].agg('count')
+            large_mask = group_count > 6
+            grouping_large = grouping[large_mask.loc[grouping['group']].values]
+            logger.log('[indexing]: splitting(depth=%d, triangles=%d, nodes=%d)' % (self.depth, len(grouping_large), node_count))
+            if len(grouping_large) <= 0:
                 break
-            print(f'[index]: level={_}...', file=sys.stderr)
-            large_group_mask = affinity_list['group'].isin(large_group_count.index)
-            minmax_data = self.data[large_group_mask]
-            affinity_list = affinity_list[large_group_mask]
-            affinity_sort = pandas.DataFrame(dict([(dim, affinity_list.sort_values(['group', 'affinity.%s' % dim]).index) for dim in 'xyz']), index=affinity_list.index)
-            affinity_sort_groupby = dict([(dim, minmax_data.loc[affinity_sort[dim]].groupby('group')) for dim in 'xyz'])
-            affinity_index = dict([('min.%s' % dim, affinity_sort_groupby[dim].apply(lambda g: g[:len(g) >> 1], include_groups=False).index.get_level_values(1).values) for dim in 'xyz'] + [('max.%s' % dim, affinity_sort_groupby[dim].apply(lambda g: g[len(g) >> 1:], include_groups=False).index.get_level_values(1).values) for dim in 'xyz'])
-            for dim in 'xyz':
-                affinity_list.loc[affinity_index['min.%s' % dim], 'subgroup.%s' % dim] = 1
-                affinity_list.loc[affinity_index['max.%s' % dim], 'subgroup.%s' % dim] = 2
-            group_overlap = pandas.DataFrame(dict([('%s.%s' % (self._lim[d], dim), minmax_data.loc[affinity_index['%s.%s' % (self._lim[1-d], dim)]].groupby('group')['%s.%s' % (self._lim[d], dim)].agg(self._lim[d])) for d in range(2) for dim in 'xyz']))
-            group_overlap_data = group_overlap.loc[minmax_data['group']].reset_index(drop=True)
-            group_overlap_data.index = minmax_data.index
-            min_group_overlap = dict([(dim, (minmax_data.loc[affinity_index['min.%s' % dim], 'max.%s' % dim] - group_overlap_data.loc[affinity_index['min.%s' % dim], 'min.%s' % dim])) for dim in 'xyz'])
-            max_group_overlap = dict([(dim, (group_overlap_data.loc[affinity_index['max.%s' % dim], 'max.%s' % dim] - minmax_data.loc[affinity_index['max.%s' % dim], 'min.%s' % dim])) for dim in 'xyz'])
-            group_overlap = pandas.DataFrame(dict([(dim, pandas.concat([min_group_overlap[dim], max_group_overlap[dim]], axis=0)) for dim in 'xyz']))
-            group_overlap['group'] = affinity_list['group']
-            group_overlap_count = pandas.DataFrame(dict([(dim, group_overlap[group_overlap[dim] >= 0].groupby('group')[dim].agg('count').astype('UInt32')) for dim in 'xyz']), index=group_overlap.groupby('group').groups.keys())
-            group_overlap_count.fillna(0, inplace=True)
-            group_overlap_count.columns = range(3)
-            split_dim = group_overlap_count.idxmin(axis=1)
-            overlap_column = split_dim[group_overlap['group']].reset_index(drop=True)
-            overlap_column.index = group_overlap.index
-            group_overlap['overlap'] = pandas.Series(group_overlap[['x', 'y', 'z']].values[numpy.arange(len(group_overlap)), split_dim.loc[group_overlap['group']].values], index=group_overlap.index)
-            affinity_list['subgroup'] = pandas.Series(affinity_list[['subgroup.%s' % dim for dim in 'xyz']].values[numpy.arange(len(affinity_list)), split_dim.loc[affinity_list['group']].values], index=affinity_list.index)
-            group_overlap_sort = group_overlap.sort_values(['group', 'overlap'], ascending=[True, False])
-            mix_group = group_overlap_sort.groupby('group')['overlap'].apply(lambda g: g[g >= 0].head(len(g) // 3))
-            affinity_list.loc[mix_group.index.get_level_values(1), 'subgroup'] = 3
-            separation_data = pandas.DataFrame(minmax_data.loc[affinity_list.index])
-            separation_data['subgroup'] = affinity_list['subgroup']
-            separation_data_groupby = separation_data.groupby(['group', 'subgroup'])
-            new_nodes = separation_data_groupby.agg(dict([('%s.%s' % (lim, dim), lim) for lim in ['min', 'max'] for dim in 'xyz'] + [('subgroup', 'count')]))
-            new_nodes.rename(columns={'subgroup': 'count'}, inplace=True)
-            new_nodes['count'] = new_nodes['count'].astype('uint32')
-            new_nodes['node_index'] = (numpy.arange(len(new_nodes)) + self.nodes.index.max() + 1).astype('uint32')
-            new_nodes['parent_node'] = new_nodes.index.get_level_values(0)
-            new_nodes_by_group = new_nodes.groupby(level=0)
-            new_nodes.loc[new_nodes_by_group.head(-1).index, 'next_sibling'] = pandas.Series(new_nodes_by_group.tail(-1)['node_index'].values, dtype='UInt32').values
-            new_nodes.fillna({'next_sibling': 0}, inplace=True)
-            new_nodes['first_child'] = numpy.uint32(0)
-            new_nodes['first_child'] = new_nodes['first_child'].astype('UInt32')
-            self.nodes.loc[new_nodes_by_group['parent_node'].head(1).values, 'first_child'] = new_nodes_by_group['node_index'].head(1).values
-            append_nodes = pandas.DataFrame(new_nodes[self.nodes.columns].reset_index(drop=True))
-            append_nodes.index = new_nodes['node_index']
-            self.nodes = pandas.concat([self.nodes, append_nodes], axis=0)
-            separation_index = numpy.vstack([separation_data.index.values, separation_data['group'].values, separation_data['subgroup'].values]).T
-            separation_groups, separation_num_index = numpy.unique(separation_index[:, 1:], return_inverse=True, axis=0)
-            separation_node_index = new_nodes.loc[list(zip(separation_groups[:, 0], separation_groups[:, 1]))]['node_index'].values
-            self.data.loc[separation_data.index, 'group'] = separation_node_index[separation_num_index]
-            print(f'[index] level={_}, nodes={len(self.nodes)}', file=sys.stderr)
-        print('[index] Index complete, total nodes: %d' % len(self.nodes), file=sys.stderr)
-        self.root_node = 1
-        self.nodes.loc[0] = {k: v.type(0) for k, v in self.nodes.dtypes.items()}
-        self.nodes.sort_index(inplace=True)
-
-        print(f'[index] Creating nodes for {len(self.data)} triangles...', file=sys.stderr)
-
-        self.data['index'] = self.data.index
-        self.data.index += len(self.nodes) - 1
-        self.data.sort_values(['group', 'index'], inplace=True)
-        data_first_child = self.data.groupby('group').head(1)
-        self.nodes.loc[data_first_child['group'], 'first_child'] = data_first_child.index
-        self.data.rename(columns={'group': 'parent_node'}, inplace=True)
-        self.data['first_child'] = numpy.uint32(0)
-        self.data['next_sibling'] = numpy.uint32(0)
-        data_node_groups = self.data.groupby('parent_node')
-        self.data.loc[data_node_groups.head(-1).index, 'next_sibling'] = data_node_groups.tail(-1).index
-        self.data['count'] = numpy.uint32(1)
-        self.data.sort_index(inplace=True)
-
-        nodes_src = self.nodes.to_records(index=False)
-        nodes_dtype = numpy.dtype([
-            ('type', '<u4'),
-            ('ref', '<u4'),
-            ('leaf_count', '<u4'),
-            ('parent_node', '<u4'),
-            ('next_sibling', '<u4'),
-            ('first_child', '<u4'),
-            ('reserved1', '<u4'),
-            ('reserved2', '<u4')
-        ])
-        self.database = [None]
-        self.database.append(numpy.stack([
-            numpy.vstack([self.nodes['min.%s' % dim].values for dim in 'xyz']).T,
-            numpy.vstack([self.nodes['max.%s' % dim].values for dim in 'xyz']).T
-        ], axis=1))
-        self.database.append(mesh.triangles)
-        bbox_nodes = numpy.recarray(tuple([len(self.nodes)]), dtype=nodes_dtype)
-        bbox_nodes['type'] = 1
-        bbox_nodes['ref'] = self.nodes.index.values
-        bbox_nodes['leaf_count'] = self.nodes['count']
-        bbox_nodes['parent_node'] = self.nodes['parent_node']
-        bbox_nodes['next_sibling'] = self.nodes['next_sibling']
-        bbox_nodes['first_child'] = self.nodes['first_child']
-        bbox_nodes['reserved1'] = bbox_nodes['reserved2'] = 0
-        trig_nodes = numpy.recarray(tuple([len(self.data)]), dtype=nodes_dtype)
-        trig_nodes['type'] = 2
-        trig_nodes['ref'] = self.data['index']
-        trig_nodes['leaf_count'] = self.data['count']
-        trig_nodes['parent_node'] = self.data['parent_node']
-        trig_nodes['next_sibling'] = self.data['next_sibling']
-        trig_nodes['first_child'] = self.data['first_child']
-        trig_nodes['reserved1'] = trig_nodes['reserved2'] = 0
-        self.nodes = numpy.hstack([bbox_nodes, trig_nodes])
-        del self.data
-        print(f'[index] Done!', file=sys.stderr)
+            affinity = (self.database[bounding_box_type][grouping_large.index, 0] + self.database[bounding_box_type][grouping_large.index, 1]) - (self.database[bounding_box_type][grouping_large['group'], 0] + self.database[bounding_box_type][grouping_large['group'], 1])
+            for idx, dim in enumerate('xyz'):
+                grouping_large.loc[grouping_large.index, 'affinity.%s' % dim] = affinity[:, idx]
+                affinity_sort = grouping_large.sort_values(['group', 'affinity.%s' % dim])
+                affinity_sort_group = affinity_sort.groupby('group', sort=False)
+                min_group = affinity_sort_group.apply(lambda g: g[:len(g) >> 1])
+                max_group = affinity_sort_group.apply(lambda g: g[len(g) >> 1:])
+                grouping_large.loc[min_group.index.get_level_values(1), 'subgroup.%s' % dim] = 1
+                grouping_large.loc[max_group.index.get_level_values(1), 'subgroup.%s' % dim] = 2
+                grouping_large.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx]
+                grouping_large.loc[max_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][max_group.index.get_level_values(1)][:, 0, idx]
+                affinity_subgroup = grouping_large.groupby(['group', 'subgroup.%s' % dim], sort=False)
+                overlap = affinity_subgroup['overlap.%s' % dim].agg(['min', 'max'])
+                grouping_large.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx] - overlap.loc[grouping_large.loc[min_group.index.get_level_values(1)]['group']].xs(2, level=1)['min'].values
+                grouping_large.loc[max_group.index.get_level_values(1), 'overlap.%s' % dim] = overlap.loc[grouping_large.loc[max_group.index.get_level_values(1)]['group']].xs(1, level=1)['max'].values - self.database[bounding_box_type][max_group.index.get_level_values(1)][:, 0, idx]
+                pass
+            is_overlap = pandas.concat([grouping_large['group'], grouping_large[['overlap.%s' % dim for dim in 'xyz']] >= 0.0], axis=1)
+            is_overlap_group = is_overlap.groupby('group')
+            overlap_count = is_overlap_group.sum()
+            overlap_count.columns = range(3)
+            split_dim = overlap_count.idxmin(axis=1)
+            split_column = split_dim.loc[grouping_large['group']]
+            grouping_large.loc[grouping_large.index, 'overlap'] = grouping_large[['overlap.%s' % dim for dim in 'xyz']].values[numpy.arange(len(grouping_large.index)), split_column.values]
+            grouping_large.loc[grouping_large.index, 'subgroup'] = grouping_large[['subgroup.%s' % dim for dim in 'xyz']].values[numpy.arange(len(grouping_large.index)), split_column.values]
+            overlap_mask = grouping_large['overlap'] >= 0.0
+            overlap_rows = grouping_large[overlap_mask].groupby('group', sort=False).apply(lambda g: g.head(group_count.loc[g.name] // 3))
+            grouping_large.loc[overlap_rows.index.get_level_values(1), 'subgroup'] = 3
+            grouping_sort = grouping_large.sort_values(['group', 'subgroup', 'index'])
+            grouping_split = grouping_sort.groupby(['group', 'subgroup'], sort=False)
+            grouping_split_box = grouping_split.agg(dict([('%s.%s' % (lim, dim), lim) for lim in lims for dim in 'xyz']) | {'subgroup': 'count'})
+            grouping_split_box.rename(columns={'subgroup': 'size'}, inplace=True)
+            grouping_split_box['box_ref'] = bounding_box_count + numpy.arange(len(grouping_split_box))
+            grouping_split_box['node_ref'] = node_count + numpy.arange(len(grouping_split_box))
+            self.database[bounding_box_type][grouping_split_box['box_ref']] = grouping_split_box[['%s.%s' % (lim, dim) for lim in lims for dim in 'xyz']].astype(numpy.float32).values.reshape(-1, 2, 3)
+            pass
+            self.nodes['type'][grouping_split_box['node_ref']] = bounding_box_type
+            self.nodes['ref'][grouping_split_box['node_ref']] = grouping_split_box['box_ref']
+            self.nodes['size'][grouping_split_box['node_ref']] = grouping_split_box['size'].astype(numpy.uint32)
+            self.nodes['parent_node'][grouping_split_box['node_ref']] = grouping_split_box.index.get_level_values(0).astype(numpy.uint32)
+            self.nodes['first_child'][grouping_split_box['node_ref']] = 0
+            self.nodes['next_sibling'][grouping_split_box['node_ref']] = 0
+            grouping_first_child = grouping_split_box.xs(1, level=1)['node_ref']
+            assert numpy.all(self.nodes[grouping_first_child.index.astype(numpy.uint32)]['first_child'] == 0)
+            self.nodes['first_child'][grouping_first_child.index.astype(numpy.uint32)] = grouping_first_child
+            grouping_split_box_group = grouping_split_box.groupby('group', sort=False)
+            self.nodes['next_sibling'][grouping_split_box_group.head(-1)['node_ref']] = grouping_split_box_group.tail(-1)['node_ref']
+            bounding_box_count += len(grouping_split_box)
+            node_count += len(grouping_split_box)
+            grouping.loc[grouping_large.index, 'group'] = grouping_split_box.loc[pandas.MultiIndex.from_frame(grouping_large[['group', 'subgroup']])]['node_ref'].values
+            pass
+        self.database[bounding_box_type] = self.database[bounding_box_type][:bounding_box_count]
+        self.nodes = self.nodes[:node_count]
+        logger.log('[indexing]: done(depth=%d, triangles=%d, nodes=%d)' % (self.depth, len(mesh.triangles[1:]), len(self.nodes)))

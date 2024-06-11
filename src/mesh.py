@@ -10,13 +10,6 @@ class Mesh:
         texcoord_data = numpy.array(texcoord_data, dtype=numpy.float32)
         face_data = numpy.array(face_data, dtype=numpy.uint32)
 
-        self.position = pandas.DataFrame(dict([(dim, position_data[:, idx]) for idx, dim in enumerate('xyz')]))
-        self.normal = pandas.DataFrame(dict([(dim, normal_data[:, idx]) for idx, dim in enumerate('xyz')]))
-        self.texcoord = pandas.DataFrame(dict([(dim, normal_data[:, idx]) for idx, dim in enumerate('uv')]))
-        self.vertices, vertex_index = numpy.unique(face_data.reshape(-1, 3), return_inverse=True, axis=0)
-        self.vertices = pandas.DataFrame(dict([(dim, self.vertices[:, idx]) for idx, dim in enumerate(['position', 'texcoord', 'normal'])]))
-        self.face = pandas.DataFrame(dict([(idx, vertex_index.reshape(face_data.shape[:2])[:, idx].astype(numpy.uint32)) for idx in range(3)]))
-
         self.triangles = numpy.core.records.fromarrays([
             position_data[face_data[:, :, 0]],
             normal_data[face_data[:, :, 2]],
