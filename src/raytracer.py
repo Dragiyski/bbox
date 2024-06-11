@@ -1,5 +1,9 @@
 import sys, numpy, pandas
 from index import MeshIndex
+from mesh import Mesh
+from util import Data, normalize
+from logger import NullLogger
+from PIL import Image
 
 job_dtype = numpy.dtype([
     ('pixel', '<2u4'),
@@ -14,8 +18,9 @@ job_dtype = numpy.dtype([
 epsilon = numpy.finfo(numpy.float32).eps
 
 class Raytracer:
-    def __init__(self, index: MeshIndex):
+    def __init__(self, index, logger=NullLogger()):
         self.index = index
+        self.logger = logger
         self.jobs_by_type = { job_type: numpy.empty((0,), dtype=job_dtype) for job_type in numpy.unique(index.nodes['type']) }
         self.raytrace_per_type = { job_type: 0 for job_type in self.jobs_by_type.keys() }
 
@@ -73,7 +78,7 @@ class Raytracer:
         )
 
     def screen(self, width=800, height=600, **kwargs):
-        camera = self._process_camera_options(width / height, **kwargs)
+        self.camera = self._process_camera_options(width / height, **kwargs)
         self.color_buffer = numpy.zeros((height, width, 3), dtype=numpy.float32)
         self.depth_buffer = numpy.full((height, width), numpy.float32(numpy.inf))
 
@@ -82,13 +87,13 @@ class Raytracer:
         view_pixels[:, :, 0] = (view_pixels[:, :, 0] + 0.5) / height
         view_pixels[:, :, 0] = 1.0 - view_pixels[:, :, 0]
         view_pixels = view_pixels * 2.0 - 1.0
-        world_pixels = camera.world_screen_center + view_pixels[:, :, 0, None] * camera.world_screen_up + view_pixels[:, :, 1, None] * camera.world_screen_right
-        ray_direction = normalize(world_pixels - camera.position)
+        world_pixels = self.camera.world_screen_center + view_pixels[:, :, 0, None] * self.camera.world_screen_up + view_pixels[:, :, 1, None] * self.camera.world_screen_right
+        ray_direction = normalize(world_pixels - self.camera.position)
 
         self.jobs_by_type[1] = numpy.recarray(width * height, job_dtype)
         self.jobs_by_type[1]['pixel'] = numpy.vstack([numpy.repeat(numpy.arange(height), width), numpy.tile(numpy.arange(width), height)]).T
         self.jobs_by_type[1]['node'] = self.index.root_node
-        self.jobs_by_type[1]['ray_origin'] = camera.position
+        self.jobs_by_type[1]['ray_origin'] = self.camera.position
         self.jobs_by_type[1]['ray_direction'] = ray_direction.reshape(-1, 3)
         self.jobs_by_type[1]['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
 
@@ -153,18 +158,18 @@ class Raytracer:
         self.raytrace(**kwargs)
 
     
-    def raytrace(self, max_level=None, draw_jobs=True, **kwargs):
-        if max_level is None:
-            max_level = self.index.depth
-        for _ in range(max_level):
-            print('[raytracer] level=%d: jobs: %r' % (_, {k: v.shape[0] for k, v in self.jobs_by_type.items()}), file=sys.stderr)
+    def raytrace(self, max_depth=None, draw_jobs=True, **kwargs):
+        if max_depth is None:
+            max_depth = self.index.depth
+        for _ in range(max_depth):
+            self.logger.log('[raytracer] level=%d: jobs: %r' % (_, {k: v.shape[0] for k, v in self.jobs_by_type.items()}))
             self.raytrace_per_type[1] += self.jobs_by_type[1].shape[0]
-            print('[raytracer] level=%d: Raytracing %d bounding boxes...' % (_, self.jobs_by_type[1].shape[0]), file=sys.stderr)
+            self.logger.log('[raytracer] level=%d: Raytracing %d bounding boxes...' % (_, self.jobs_by_type[1].shape[0]))
             self.intersect_bounding_box()
             self.schedule_children()
 
-        print('[raytracer] level=%d: jobs: %r' % (_, {k: v.shape[0] for k, v in self.jobs_by_type.items()}), file=sys.stderr)
-        print('[raytracer] level=%d: Raytracing %d triangles...' % (_, self.jobs_by_type[2].shape[0]), file=sys.stderr)
+        self.logger.log('[raytracer] level=%d: jobs: %r' % (_, {k: v.shape[0] for k, v in self.jobs_by_type.items()}))
+        self.logger.log('[raytracer] level=%d: Raytracing %d triangles...' % (_, self.jobs_by_type[2].shape[0]))
         self.raytrace_per_type[2] += self.jobs_by_type[2].shape[0]
         self.insersect_triangles()
 
@@ -287,7 +292,7 @@ class Raytracer:
         jobs = numpy.hstack(list(self.jobs_by_type.values()))
         active_job_mask = (jobs['flags'] & 1).astype(bool)
         active_jobs = jobs[active_job_mask]
-        print('[raytracer] Drawing %d triangles...' % (active_jobs.shape[0]))
+        self.logger.log('[raytracer] Drawing %d primitives...' % (active_jobs.shape[0]))
         pixel_distance = pandas.DataFrame({'y': active_jobs['pixel'][:, 0], 'x': active_jobs['pixel'][:, 1], 'd': active_jobs['ray_range'][:, 0]})
         pixel_depth_resolver = pixel_distance.groupby(['y', 'x'])['d'].idxmin()
         depth_mask = active_jobs['ray_range'][pixel_depth_resolver.values, 0] <= self.depth_buffer[pixel_depth_resolver.index.get_level_values(0).values, pixel_depth_resolver.index.get_level_values(1).values]
@@ -350,34 +355,117 @@ class Raytracer:
         color_buffer = (numpy.clip(self.color_buffer, 0.0, 1.0) * 255.0).astype(numpy.uint8)
         image = Image.fromarray(color_buffer)
         image.show()
+
+def parse_index_file(input, error):
+    signature = input.read(4)
+    if signature != b'\x7fd3i':
+        error('Not valid input file: invalid file signature')
+    byteorder = 'little'
+    version_major = int.from_bytes(input.read(2), byteorder)
+    version_minor = int.from_bytes(input.read(2), byteorder)
+    if version_major != 0 or version_minor != 1:
+        error('Not valid input file: cannot operate on version %d.%d, expected version 0.1' % (version_major, version_minor))
+    tree_node_count = int.from_bytes(input.read(4), byteorder)
+    tree_depth = int.from_bytes(input.read(4), byteorder)
+    tree_root_node = int.from_bytes(input.read(4), byteorder)
+    tree_nbytes = int.from_bytes(input.read(4), byteorder)
+
+    database_count = int.from_bytes(input.read(4), byteorder)
+    if database_count != 2:
+        error('Not valid input file: d3i version 0.1 should only have 2 databases')
+    database_size = [0] * database_count
+    database_nbytes = [0] * database_count
+    for dbi in range(database_count):
+        database_size[dbi] = int.from_bytes(input.read(4), byteorder)
+        database_nbytes[dbi] = int.from_bytes(input.read(4), byteorder)
+
+    if tree_node_count * MeshIndex.node_dtype.itemsize != tree_nbytes:
+        error('Not valid input file: tree_node_count * tree_node_nbytes must be tree_nbytes')
+    if database_size[0] * 24 != database_nbytes[0]:
+        error('Not valid input file: bounding_box_count * 2 * 3 * sizeof(float32) must be database_nbytes[0]')
+    if database_size[1] * 3 * Mesh.vertex_dtype.itemsize != database_nbytes[1]:
+        error('Not valid input file: triangle_count * 3 * vertex_nbytes must be database_nbytes[1]')
+
+    buffer_nodes = input.read(tree_nbytes)
+    buffer_databases = []
+    for dbi in range(database_count):
+        buffer_databases.append(input.read(database_nbytes[dbi]))
+
+    input_nodes = numpy.frombuffer(buffer_nodes, dtype=MeshIndex.node_dtype)
+    input_database = [None] * 3
+    input_database[1] = numpy.frombuffer(buffer_databases[0], dtype=numpy.float32).reshape(-1, 2, 3)
+    input_database[2] = numpy.frombuffer(buffer_databases[1], dtype=(Mesh.vertex_dtype, 3))
+
+    return Data(
+        depth=tree_depth,
+        root_node=tree_root_node,
+        nodes=input_nodes,
+        database=input_database
+    )
+
+def main():
+    from argparse import ArgumentParser, FileType
+    from pathlib import Path
+    from logger import StderrLogger
+    logger = StderrLogger()
+    parser = ArgumentParser(description='Raytrace an index file generated by index.py')
+    parser.add_argument('--camera-position', type=float, nargs=3, metavar=('x', 'y', 'z'), default=[0.0, 0.0, 0.0], help='The position of the camera.')
+    camera_direction_group = parser.add_mutually_exclusive_group()
+    camera_direction_group.add_argument('--camera-direction', type=float, nargs=3, metavar=('x', 'y', 'z'), help='The direction vector of the camera.', default=[0.0, 1.0, 0.0])
+    camera_direction_group.add_argument('--camera-focus-at', type=float, nargs=3, metavar=('x', 'y', 'z'), help='A point at which the camera is centered upon.')
+    parser.add_argument('--world-up', type=float, nargs=3, metavar=('x', 'y', 'z'), default=[0.0, 0.0, 1.0], help='A vector pointing in "up" direction in the world.')
+    parser.add_argument('--field-of-view', '--fov', type=float, help='The diagonal field-of-view angle in degrees.')
+    parser.add_argument('--input', '-i', required=True, type=lambda value: sys.stdin.buffer if value == '-' else open(Path(value).resolve(strict=True), 'rb'), default=None, help='Index file to raytrace.')
+    parser.add_argument('--max-depth', type=int, default=None, help='Cascade on the tree up to maximum depth')
+    raytrace_method = parser.add_subparsers(title='method', required=True, dest='method', help='Raytracing method to perform.')
+    raytrace_screen = raytrace_method.add_parser('screen', help='Raytrace an image with specified width and height.', description='Raytrace an entire image and store the result as PNG image. If the result is only displayed, it is stored as temporary file.')
+    raytrace_screen.add_argument('width', type=int, help='The width of the screen/image')
+    raytrace_screen.add_argument('height', type=int, help='The height of the screen/image')
+    raytrace_screen.add_argument('--output', '-o', nargs=1, type=lambda value: sys.stdout.buffer if value == '-' else open(Path(value).resolve(strict=False), 'wb'), default=None, help='The output file to write a PNG image.')
+    raytrace_screen.add_argument('--display', '-d', action='store_true', default=False, help='Display the raytraced image')
+    raytrace_pixel = raytrace_method.add_parser('pixel', help='Raytrace a single pixel at (x, y) from image with specified width and height.', description='Raytrace a single pixel and display the result of intermediates for debugging.')
+    raytrace_pixel.add_argument('x', type=int, help='The x coordinate of the pixel')
+    raytrace_pixel.add_argument('y', type=int, help='The x coordinate of the pixel')
+    raytrace_pixel.add_argument('width', type=int, help='The width of the image')
+    raytrace_pixel.add_argument('height', type=int, help='The height of the image')
+    args = parser.parse_args()
+
+    input_data = parse_index_file(args.input, parser.error)
+    args.input.close()
+
+    raytracer_kwargs = {}
+    for name in ['aspect_ratio', 'field_of_view', 'camera_position', 'world_up', 'camera_direction', 'camera_focus_at', 'max_depth']:
+        if name in args and getattr(args, name) is not None:
+            raytracer_kwargs[name] = getattr(args, name)
+    raytracer = Raytracer(input_data, logger=logger)
+    if args.method == 'screen':
+        method = raytracer.screen
+        for name in ['width', 'height']:
+            if name in args and getattr(args, name) is not None:
+                raytracer_kwargs[name] = getattr(args, name)
+    elif args.method == 'pixel':
+        method = raytracer.pixel
+        for name in ['x', 'y', 'width', 'height']:
+            if name in args and getattr(args, name) is not None:
+                raytracer_kwargs[name] = getattr(args, name)
+    else:
+        parser.error('Invalid of missing method: %r' % (args.method if 'method' in args else None))
+    if 'camera_focus_at' in raytracer_kwargs and 'camera_direction' in raytracer_kwargs:
+        del raytracer_kwargs['camera_direction']
     
-    def run(self):
-        self.color_buffer = numpy.zeros((self.height, self.width, 3), dtype=numpy.float32)
-        self.depth_buffer = numpy.full((self.height, self.width), numpy.float32(numpy.inf))
+    method(**raytracer_kwargs)
 
-        ray_origin = self.camera_position
-        view_pixels = numpy.moveaxis(numpy.mgrid[0:self.height, 0:self.width], 0, -1).astype(numpy.float32)
-        view_pixels[:, :, 1] = (view_pixels[:, :, 1] + 0.5) / self.width
-        view_pixels[:, :, 0] = (view_pixels[:, :, 0] + 0.5) / self.height
-        view_pixels[:, :, 0] = 1.0 - view_pixels[:, :, 0]
-        view_pixels = view_pixels * 2.0 - 1.0
-        world_pixels = self.world_screen_center + view_pixels[:, :, 0, None] * self.world_screen_up + view_pixels[:, :, 1, None] * self.world_screen_right
-        ray_direction = normalize(world_pixels - ray_origin)
+    if args.method == 'screen':
+        if args.output is not None or args.display:
+            color_buffer = (numpy.clip(raytracer.color_buffer, 0.0, 1.0) * 255.0).astype(numpy.uint8)
+            image = Image.fromarray(color_buffer)
+            if args.output is not None:
+                image.save(args.output, 'png', optimize=True, compress_level=9)
+            if args.display:
+                image.show()
 
-        self.jobs_by_type[1] = numpy.recarray(self.width * self.height, job_dtype)
-        self.jobs_by_type[1]['pixel'] = numpy.vstack([numpy.repeat(numpy.arange(self.height), self.width), numpy.tile(numpy.arange(self.width), self.height)]).T
-        self.jobs_by_type[1]['node'] = 1
-        self.jobs_by_type[1]['ray_origin'] = ray_origin
-        self.jobs_by_type[1]['ray_direction'] = ray_direction.reshape(-1, 3)
-        self.jobs_by_type[1]['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
+    print(args)
+    return 0
 
-
-        for _ in range(self.index.depth):
-            self.intersect_bounding_box()
-            self.schedule_children()
-        # assert len(self.jobs_by_type[1]) == 0, 'len(self.jobs_by_type[1]) == 0'
-
-        self.insersect_triangles()
-        self.draw_jobs()
-        self.display_color_buffer()
-        pass
+if __name__ == '__main__':
+    sys.exit(main())

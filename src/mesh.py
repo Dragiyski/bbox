@@ -1,9 +1,8 @@
 import numpy
 import pandas
 
-vertex_type = numpy.dtype([('position', '3f4'), ('normal', '3f4'), ('texcoord', '2f4')])
-
 class Mesh:
+    vertex_dtype = numpy.dtype([('position', '3f4'), ('normal', '3f4'), ('texcoord', '2f4')])
     def __init__(self, *, position_data = [[0, 0, 0]], normal_data = [[0, 0, 0]], texcoord_data = [[0, 0]], face_data = [[[0, 0, 0], [0, 0, 0], [0, 0, 0]]]):
         position_data = numpy.array(position_data, dtype=numpy.float32)
         normal_data = numpy.array(normal_data, dtype=numpy.float32)
@@ -14,7 +13,7 @@ class Mesh:
             position_data[face_data[:, :, 0]],
             normal_data[face_data[:, :, 2]],
             texcoord_data[face_data[:, :, 1]],
-        ], dtype=vertex_type)
+        ], dtype=self.vertex_dtype)
 
     @classmethod
     def from_wavefront_stream(cls, stream):

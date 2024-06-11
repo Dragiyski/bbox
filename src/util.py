@@ -25,3 +25,16 @@ def human_readable_bytes(num_bytes):
     
     # Format the number with the appropriate suffix
     return (f'{num_bytes:.2f}' if i > 0 else f'{num_bytes}') + byte_suffixes[i]
+
+class ByteCounterStream:
+    def __init__(self, stream):
+        self._stream = stream
+        self.bytes_read = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = next(self._stream)
+        self.bytes_read += len(line.encode(self._stream.encoding))
+        return line

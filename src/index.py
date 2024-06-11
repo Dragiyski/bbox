@@ -35,14 +35,14 @@ class MeshIndex:
         self.nodes['type'][1:1+triangle_minmax.shape[0]] = triangle_type
         self.nodes['ref'][1:1+triangle_minmax.shape[0]] = numpy.arange(triangle_minmax.shape[0]) + 1
         self.nodes['size'][1:1+triangle_minmax.shape[0]] = 1
-        root_node = node_count = 1 + triangle_minmax.shape[0] 
-        self.nodes[root_node] = tuple([bounding_box_type, bounding_box_count, triangle_minmax.shape[0], 0, 0, 0])
+        self.root_node = node_count = 1 + triangle_minmax.shape[0] 
+        self.nodes[self.root_node] = tuple([bounding_box_type, bounding_box_count, triangle_minmax.shape[0], 0, 0, 0])
         node_count += 1
         self.database[bounding_box_type][bounding_box_count] = numpy.vstack([triangle_minmax[:, 0].min(axis=0), triangle_minmax[:, 1].max(axis=0)])
         bounding_box_count += 1
 
         grouping = pandas.DataFrame({
-            'group': pandas.Series(root_node, dtype='UInt32', index=numpy.arange(triangle_minmax.shape[0]) + 1),
+            'group': pandas.Series(self.root_node, dtype='UInt32', index=numpy.arange(triangle_minmax.shape[0]) + 1),
             'affinity.x': pandas.Series(dtype='Float32'),
             'affinity.y': pandas.Series(dtype='Float32'),
             'affinity.z': pandas.Series(dtype='Float32'),
@@ -71,8 +71,8 @@ class MeshIndex:
                 grouping_large.loc[grouping_large.index, 'affinity.%s' % dim] = affinity[:, idx]
                 affinity_sort = grouping_large.sort_values(['group', 'affinity.%s' % dim])
                 affinity_sort_group = affinity_sort.groupby('group', sort=False)
-                min_group = affinity_sort_group.apply(lambda g: g[:len(g) >> 1])
-                max_group = affinity_sort_group.apply(lambda g: g[len(g) >> 1:])
+                min_group = affinity_sort_group.apply(lambda g: g[:len(g) >> 1], include_groups=False)
+                max_group = affinity_sort_group.apply(lambda g: g[len(g) >> 1:], include_groups=False)
                 grouping_large.loc[min_group.index.get_level_values(1), 'subgroup.%s' % dim] = 1
                 grouping_large.loc[max_group.index.get_level_values(1), 'subgroup.%s' % dim] = 2
                 grouping_large.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx]
@@ -91,7 +91,7 @@ class MeshIndex:
             grouping_large.loc[grouping_large.index, 'overlap'] = grouping_large[['overlap.%s' % dim for dim in 'xyz']].values[numpy.arange(len(grouping_large.index)), split_column.values]
             grouping_large.loc[grouping_large.index, 'subgroup'] = grouping_large[['subgroup.%s' % dim for dim in 'xyz']].values[numpy.arange(len(grouping_large.index)), split_column.values]
             overlap_mask = grouping_large['overlap'] >= 0.0
-            overlap_rows = grouping_large[overlap_mask].groupby('group', sort=False).apply(lambda g: g.head(group_count.loc[g.name] // 3))
+            overlap_rows = grouping_large[overlap_mask].groupby('group', sort=False).apply(lambda g: g.head(group_count.loc[g.name] // 3), include_groups=False)
             grouping_large.loc[overlap_rows.index.get_level_values(1), 'subgroup'] = 3
             grouping_sort = grouping_large.sort_values(['group', 'subgroup', 'index'])
             grouping_split = grouping_sort.groupby(['group', 'subgroup'], sort=False)
@@ -119,3 +119,42 @@ class MeshIndex:
         self.database[bounding_box_type] = self.database[bounding_box_type][:bounding_box_count]
         self.nodes = self.nodes[:node_count]
         logger.log('[indexing]: done(depth=%d, triangles=%d, nodes=%d)' % (self.depth, len(mesh.triangles[1:]), len(self.nodes)))
+
+def main():
+    if __debug__:
+        numpy.set_printoptions(suppress=True)
+    from logger import StderrLogger
+    from util import human_readable_bytes, ByteCounterStream
+    logger = StderrLogger()
+    input_stream = ByteCounterStream(sys.stdin)
+
+    logger.log('[stdin]: read/parse wavefront .obj file...')
+    mesh = Mesh.from_wavefront_stream(input_stream)
+    logger.log('[stdin]: done(bytes_read=%s, triangles=%s)' % (human_readable_bytes(input_stream.bytes_read), len(mesh.triangles[1:])))
+
+    box_index = MeshIndex(mesh, logger=StderrLogger())
+
+    database_count = max(box_index.database.keys())
+    output_size = 32 + box_index.nodes.nbytes + sum(a.nbytes for a in box_index.database.values())
+    logger.log('[stdout]: writing(bytes=%s)' % human_readable_bytes(output_size))
+    byteorder = 'little'
+
+    sys.stdout.buffer.write(b'\x7fd3i') # File signature (0x7F ensures file is always recognized as binary)
+    sys.stdout.buffer.write((0).to_bytes(2, byteorder)) # Version major = 0 (experimental)
+    sys.stdout.buffer.write((1).to_bytes(2, byteorder)) # Version minor = 1 (sequential)
+    sys.stdout.buffer.write((len(box_index.nodes)).to_bytes(4, byteorder)) # Number of nodes
+    sys.stdout.buffer.write(box_index.depth.to_bytes(4, byteorder)) # Depth of the three
+    sys.stdout.buffer.write(box_index.root_node.to_bytes(4, byteorder)) # Size of the tree
+    sys.stdout.buffer.write(box_index.nodes.nbytes.to_bytes(4, byteorder)) # Size of the tree
+    sys.stdout.buffer.write((database_count).to_bytes(4, byteorder)) # Number of databases
+    for idx in range(1, 1 + database_count):
+        db = box_index.database[idx]
+        sys.stdout.buffer.write(len(db).to_bytes(4, byteorder))
+        sys.stdout.buffer.write(db.nbytes.to_bytes(4, byteorder))
+    sys.stdout.buffer.write(box_index.nodes.tobytes())
+    for idx in range(1, 1 + database_count):
+        db = box_index.database[idx]
+        sys.stdout.buffer.write(db.tobytes())
+
+if __name__ == '__main__':
+    sys.exit(main())
