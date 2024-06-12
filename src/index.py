@@ -62,38 +62,39 @@ class MeshIndex:
             self.depth += 1
             group_count = grouping.groupby('group', sort=False)['group'].agg('count')
             large_mask = group_count > 6
-            grouping_large = grouping[large_mask.loc[grouping['group']].values]
-            logger.log('[indexing]: splitting(depth=%d, triangles=%d, nodes=%d)' % (self.depth, len(grouping_large), node_count))
-            if len(grouping_large) <= 0:
+            large_index = grouping.index[large_mask.loc[grouping['group']].values]
+            # grouping_large = grouping[large_mask.loc[grouping['group']].values]
+            logger.log('[indexing]: splitting(depth=%d, triangles=%d, nodes=%d)' % (self.depth, len(large_index), node_count))
+            if len(large_index) <= 0:
                 break
-            affinity = (self.database[bounding_box_type][grouping_large.index, 0] + self.database[bounding_box_type][grouping_large.index, 1]) - (self.database[bounding_box_type][grouping_large['group'], 0] + self.database[bounding_box_type][grouping_large['group'], 1])
+            affinity = (self.database[bounding_box_type][large_index, 0] + self.database[bounding_box_type][large_index, 1]) - (self.database[bounding_box_type][grouping.loc[large_index, 'group'], 0] + self.database[bounding_box_type][grouping.loc[large_index, 'group'], 1])
             for idx, dim in enumerate('xyz'):
-                grouping_large.loc[grouping_large.index, 'affinity.%s' % dim] = affinity[:, idx]
-                affinity_sort = grouping_large.sort_values(['group', 'affinity.%s' % dim])
+                grouping.loc[large_index, 'affinity.%s' % dim] = affinity[:, idx]
+                affinity_sort = grouping.loc[large_index].sort_values(['group', 'affinity.%s' % dim])
                 affinity_sort_group = affinity_sort.groupby('group', sort=False)
                 min_group = affinity_sort_group.apply(lambda g: g[:len(g) >> 1], include_groups=False)
                 max_group = affinity_sort_group.apply(lambda g: g[len(g) >> 1:], include_groups=False)
-                grouping_large.loc[min_group.index.get_level_values(1), 'subgroup.%s' % dim] = 1
-                grouping_large.loc[max_group.index.get_level_values(1), 'subgroup.%s' % dim] = 2
-                grouping_large.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx]
-                grouping_large.loc[max_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][max_group.index.get_level_values(1)][:, 0, idx]
-                affinity_subgroup = grouping_large.groupby(['group', 'subgroup.%s' % dim], sort=False)
+                grouping.loc[min_group.index.get_level_values(1), 'subgroup.%s' % dim] = 1
+                grouping.loc[max_group.index.get_level_values(1), 'subgroup.%s' % dim] = 2
+                grouping.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx]
+                grouping.loc[max_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][max_group.index.get_level_values(1)][:, 0, idx]
+                affinity_subgroup = grouping.loc[large_index].groupby(['group', 'subgroup.%s' % dim], sort=False)
                 overlap = affinity_subgroup['overlap.%s' % dim].agg(['min', 'max'])
-                grouping_large.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx] - overlap.loc[grouping_large.loc[min_group.index.get_level_values(1)]['group']].xs(2, level=1)['min'].values
-                grouping_large.loc[max_group.index.get_level_values(1), 'overlap.%s' % dim] = overlap.loc[grouping_large.loc[max_group.index.get_level_values(1)]['group']].xs(1, level=1)['max'].values - self.database[bounding_box_type][max_group.index.get_level_values(1)][:, 0, idx]
+                grouping.loc[min_group.index.get_level_values(1), 'overlap.%s' % dim] = self.database[bounding_box_type][min_group.index.get_level_values(1)][:, 1, idx] - overlap.loc[grouping.loc[min_group.index.get_level_values(1)]['group']].xs(2, level=1)['min'].values
+                grouping.loc[max_group.index.get_level_values(1), 'overlap.%s' % dim] = overlap.loc[grouping.loc[max_group.index.get_level_values(1)]['group']].xs(1, level=1)['max'].values - self.database[bounding_box_type][max_group.index.get_level_values(1)][:, 0, idx]
                 pass
-            is_overlap = pandas.concat([grouping_large['group'], grouping_large[['overlap.%s' % dim for dim in 'xyz']] >= 0.0], axis=1)
+            is_overlap = pandas.concat([grouping.loc[large_index, 'group'], grouping.loc[large_index, ['overlap.%s' % dim for dim in 'xyz']] >= 0.0], axis=1)
             is_overlap_group = is_overlap.groupby('group')
             overlap_count = is_overlap_group.sum()
             overlap_count.columns = range(3)
             split_dim = overlap_count.idxmin(axis=1)
-            split_column = split_dim.loc[grouping_large['group']]
-            grouping_large.loc[grouping_large.index, 'overlap'] = grouping_large[['overlap.%s' % dim for dim in 'xyz']].values[numpy.arange(len(grouping_large.index)), split_column.values]
-            grouping_large.loc[grouping_large.index, 'subgroup'] = grouping_large[['subgroup.%s' % dim for dim in 'xyz']].values[numpy.arange(len(grouping_large.index)), split_column.values]
-            overlap_mask = grouping_large['overlap'] >= 0.0
-            overlap_rows = grouping_large[overlap_mask].groupby('group', sort=False).apply(lambda g: g.head(group_count.loc[g.name] // 3), include_groups=False)
-            grouping_large.loc[overlap_rows.index.get_level_values(1), 'subgroup'] = 3
-            grouping_sort = grouping_large.sort_values(['group', 'subgroup', 'index'])
+            split_column = split_dim.loc[grouping.loc[large_index, 'group']]
+            grouping.loc[large_index, 'overlap'] = grouping.loc[large_index, ['overlap.%s' % dim for dim in 'xyz']].values[numpy.arange(len(large_index)), split_column.values]
+            grouping.loc[large_index, 'subgroup'] = grouping.loc[large_index, ['subgroup.%s' % dim for dim in 'xyz']].values[numpy.arange(len(large_index)), split_column.values]
+            overlap_mask = grouping.loc[large_index, 'overlap'] >= 0.0
+            overlap_rows = grouping.loc[large_index][overlap_mask].groupby('group', sort=False).apply(lambda g: g.head(group_count.loc[g.name] // 3), include_groups=False)
+            grouping.loc[overlap_rows.index.get_level_values(1), 'subgroup'] = 3
+            grouping_sort = grouping.loc[large_index].sort_values(['group', 'subgroup', 'index'])
             grouping_split = grouping_sort.groupby(['group', 'subgroup'], sort=False)
             grouping_split_box = grouping_split.agg(dict([('%s.%s' % (lim, dim), lim) for lim in lims for dim in 'xyz']) | {'subgroup': 'count'})
             grouping_split_box.rename(columns={'subgroup': 'size'}, inplace=True)
@@ -114,8 +115,14 @@ class MeshIndex:
             self.nodes['next_sibling'][grouping_split_box_group.head(-1)['node_ref']] = grouping_split_box_group.tail(-1)['node_ref']
             bounding_box_count += len(grouping_split_box)
             node_count += len(grouping_split_box)
-            grouping.loc[grouping_large.index, 'group'] = grouping_split_box.loc[pandas.MultiIndex.from_frame(grouping_large[['group', 'subgroup']])]['node_ref'].values
-            pass
+            grouping.loc[large_index, 'group'] = grouping_split_box.loc[pandas.MultiIndex.from_frame(grouping.loc[large_index, ['group', 'subgroup']])]['node_ref'].values
+        grouping_sort = grouping.sort_values(['group', 'index'])
+        grouping_sort_group = grouping_sort.groupby('group', sort=False)
+        grouping_first_child = grouping_sort_group.head(1)
+        assert numpy.all(self.nodes[grouping_first_child['group']]['first_child'] == 0), 'Leaf bounding boxes should not have assigned first child, yet'
+        self.nodes['first_child'][grouping_first_child['group']] = grouping_first_child.index
+        assert numpy.all(self.nodes[grouping.index]['next_sibling'] == 0), 'Leaf bounding boxes should not have next sibling assigned yet'
+        self.nodes['next_sibling'][grouping_sort_group.head(-1)['ref']] = grouping_sort_group.tail(-1).index
         self.database[bounding_box_type] = self.database[bounding_box_type][:bounding_box_count]
         self.nodes = self.nodes[:node_count]
         logger.log('[indexing]: done(depth=%d, triangles=%d, nodes=%d)' % (self.depth, len(mesh.triangles[1:]), len(self.nodes)))

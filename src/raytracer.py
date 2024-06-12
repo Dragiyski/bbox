@@ -13,6 +13,7 @@ job_dtype = numpy.dtype([
     ('ray_direction', '<3f4'),
     ('ray_range', '<2f4'),
     ('normal', '<3f4'),
+    ('ray_box', '<3f4', 2)
 ])
 
 epsilon = numpy.finfo(numpy.float32).eps
@@ -90,12 +91,35 @@ class Raytracer:
         world_pixels = self.camera.world_screen_center + view_pixels[:, :, 0, None] * self.camera.world_screen_up + view_pixels[:, :, 1, None] * self.camera.world_screen_right
         ray_direction = normalize(world_pixels - self.camera.position)
 
+        view_transform = numpy.identity(4)
+        view_transform[:3, 0] = self.camera.view_right
+        view_transform[:3, 1] = self.camera.view_up
+        view_transform[:3, 2] = self.camera.direction
+        view_transform[:3, 3] = self.camera.position
+        view_transform = numpy.linalg.inv(view_transform)
+
+        # model_bounding_boxes = self.index.database[1][1:]
+        # model_bounding_vertices = numpy.zeros((model_bounding_boxes.shape[0], 8, 3), model_bounding_boxes.dtype)
+        # for i in range(8):
+        #     ib = [int(bit) for bit in f'{i:03b}']
+        #     model_bounding_vertices[:, i, :] = numpy.stack([model_bounding_boxes[:, ib[j], j] for j in range(3)], axis=-1)
+        # view_bounding_vertices = numpy.einsum(
+        #     'ij,pqj->pqi',
+        #     view_transform,
+        #     numpy.concatenate([model_bounding_vertices, numpy.ones(model_bounding_vertices.shape[:2], model_bounding_vertices.dtype)[:, :, None]], axis=-1)
+        # )
+        # view_bounding_boxes = numpy.stack([view_bounding_vertices.min(axis=1), view_bounding_vertices.max(axis=1)], axis=1)
+        # root_view = view_bounding_boxes[self.index.nodes[self.index.root_node]['ref']]
+        # root_view_match = numpy.logical_and.reduce([view_pixels[:, :, 0] >= root_view[0, 0], view_pixels[:, :, 0] <= root_view[1, 0], view_pixels[:, :, 1] >= root_view[0, 1], view_pixels[:, :, 1] <= root_view[1, 1]])
+        # self.color_buffer[numpy.nonzero(root_view_match)] = [1.0, 1.0, 1.0]
+
         self.jobs_by_type[1] = numpy.recarray(width * height, job_dtype)
         self.jobs_by_type[1]['pixel'] = numpy.vstack([numpy.repeat(numpy.arange(height), width), numpy.tile(numpy.arange(width), height)]).T
         self.jobs_by_type[1]['node'] = self.index.root_node
         self.jobs_by_type[1]['ray_origin'] = self.camera.position
         self.jobs_by_type[1]['ray_direction'] = ray_direction.reshape(-1, 3)
         self.jobs_by_type[1]['ray_range'] = numpy.array([numpy.float32(0.0), numpy.float32(numpy.inf)])
+        self.jobs_by_type[1]['ray_box'] = self.index.database[1][0]
 
         # self.color_buffer[self.jobs_by_type[1]['pixel'][:, 0], self.jobs_by_type[1]['pixel'][:, 1]] = self.jobs_by_type[1]['ray_direction'] * 0.5 + 0.5
 
@@ -161,15 +185,17 @@ class Raytracer:
     def raytrace(self, max_depth=None, draw_jobs=True, **kwargs):
         if max_depth is None:
             max_depth = self.index.depth
-        for _ in range(max_depth):
-            self.logger.log('[raytracer] level=%d: jobs: %r' % (_, {k: v.shape[0] for k, v in self.jobs_by_type.items()}))
+        for depth in range(max_depth):
+            self.depth = depth
+            self.logger.log('[raytracer] depth=%d: jobs: %r' % (self.depth, {k: v.shape[0] for k, v in self.jobs_by_type.items()}))
             self.raytrace_per_type[1] += self.jobs_by_type[1].shape[0]
-            self.logger.log('[raytracer] level=%d: Raytracing %d bounding boxes...' % (_, self.jobs_by_type[1].shape[0]))
+            self.logger.log('[raytracer] depth=%d: Raytracing %d bounding boxes...' % (self.depth, self.jobs_by_type[1].shape[0]))
             self.intersect_bounding_box()
             self.schedule_children()
+        self.depth = depth
 
-        self.logger.log('[raytracer] level=%d: jobs: %r' % (_, {k: v.shape[0] for k, v in self.jobs_by_type.items()}))
-        self.logger.log('[raytracer] level=%d: Raytracing %d triangles...' % (_, self.jobs_by_type[2].shape[0]))
+        self.logger.log('[raytracer] depth=%d: jobs: %r' % (self.depth, {k: v.shape[0] for k, v in self.jobs_by_type.items()}))
+        self.logger.log('[raytracer] depth=%d: Raytracing %d triangles...' % (self.depth, self.jobs_by_type[2].shape[0]))
         self.raytrace_per_type[2] += self.jobs_by_type[2].shape[0]
         self.insersect_triangles()
 
@@ -181,9 +207,22 @@ class Raytracer:
         jobs = self.jobs_by_type[1]
         if jobs.shape[0] <= 0:
             return
-        bounding_box = self.index.database[1][jobs['node']]
-        ray_distance = (bounding_box - jobs['ray_origin'][:, None]) / jobs['ray_direction'][:, None]
-        box_ray_points = ray_distance[:, :, :, None] * jobs['ray_direction'][:, None, None] + jobs['ray_origin'][:, None, None]
+        node_box = self.index.database[1][jobs['node']]
+        ray_box = jobs['ray_box']
+        ray_box_mask = numpy.all(numpy.logical_and(ray_box[:, 1] >= node_box[:, 0], node_box[:, 1] >= ray_box[:, 0]), axis=-1)
+        bounding_box = numpy.stack([numpy.maximum(ray_box[ray_box_mask][:, 0], node_box[ray_box_mask][:, 0]), numpy.minimum(ray_box[ray_box_mask][:, 1], node_box[ray_box_mask][:, 1])], axis=1)
+        # Let R be the ray_box
+        # Let N be the current Node bounding box
+        # We have for each dimension x, y, z, two values: the minimum Vn and the maximum Vx for V in {R, N}, can be arranged as follows
+        # Rn --- Rx     Nn --- Nx
+        # Rn --- Nn +++ Rx --- Nx
+        # Rn --- Nn +++ Nx --- Rx
+        # Nn --- Rn +++ Nx --- Rx
+        # Nn --- Rn +++ Rx --- Nx
+        # Nn --- Nx     Rn --- Rx
+        self.logger.log('[raytracer]: level=%d: ray_box_filter(bounding_boxes=%d)' % (self.depth, len(bounding_box)))
+        ray_distance = (bounding_box - jobs[ray_box_mask]['ray_origin'][:, None]) / jobs[ray_box_mask]['ray_direction'][:, None]
+        box_ray_points = ray_distance[:, :, :, None] * jobs[ray_box_mask]['ray_direction'][:, None, None] + jobs[ray_box_mask]['ray_origin'][:, None, None]
         box_size = bounding_box[:, 1] - bounding_box[:, 0]
         box_ray_quad = (box_ray_points - bounding_box[:, 0][:, None, None]) / box_size[:, None, None]
         for d in range(3):
@@ -213,9 +252,10 @@ class Raytracer:
         # While those cases would only happen if something is intersected outside of the bounding box
         # Therefore the range_mask optimization is redundant (it does not optimize anything).
         
-        jobs['normal'] = 0.0
+        has_intersection_index = numpy.where(ray_box_mask)[0][has_intersection]
+        jobs['normal'][has_intersection_index] = 0.0
         normal_index = box_ray_distance.argmin(axis=-1)
-        jobs['normal'][numpy.nonzero(has_intersection)[0], normal_index % 3] = numpy.float32(normal_index // 3) * 2 - 1
+        jobs['normal'][has_intersection_index, normal_index % 3] = numpy.float32(normal_index // 3) * 2 - 1
         # range_mask = numpy.logical_or(jobs['ray_range'][has_intersection][:, 1] < box_ray_min.data, jobs['ray_range'][has_intersection][:, 0] > box_ray_max.data)
         # print('range_mask.count = %d' % numpy.count_nonzero(range_mask))
         # has_intersection[has_intersection][range_mask] = False
@@ -223,11 +263,17 @@ class Raytracer:
         #     numpy.maximum(box_ray_min.data[numpy.logical_not(range_mask)], jobs['ray_range'][has_intersection][:, 0]),
         #     numpy.minimum(box_ray_max.data[numpy.logical_not(range_mask)], jobs['ray_range'][has_intersection][:, 1]),
         # ], axis=-1)
-        jobs['ray_range'][has_intersection] = numpy.stack([
-            numpy.maximum(box_ray_min.data, jobs['ray_range'][has_intersection][:, 0]) - epsilon,
-            numpy.minimum(box_ray_max.data, jobs['ray_range'][has_intersection][:, 1]) + epsilon,
+        ray_range = numpy.stack([
+            numpy.maximum(box_ray_min.data, jobs['ray_range'][has_intersection_index][:, 0]) - epsilon,
+            numpy.minimum(box_ray_max.data, jobs['ray_range'][has_intersection_index][:, 1]) + epsilon
         ], axis=-1)
-        jobs['flags'] = has_intersection
+        ray_point = jobs[has_intersection_index]['ray_origin'][:, None] + ray_range[:, :, None] * jobs[has_intersection_index]['ray_direction'][:, None]
+        ray_box = numpy.stack([ray_point.min(axis=1), ray_point.max(axis=1)], axis=1)
+        jobs['ray_range'][has_intersection_index] = ray_range
+        jobs['ray_box'][has_intersection_index] = ray_box
+        jobs['flags'] = 0
+        jobs['flags'][has_intersection_index] = 1
+        self.logger.log('[raytracer]: level=%d: raytrace(intersected=%d)' % (self.depth, len(has_intersection_index)))
         pass
 
     def insersect_triangles(self):
@@ -407,6 +453,7 @@ def main():
     from argparse import ArgumentParser, FileType
     from pathlib import Path
     from logger import StderrLogger
+    numpy.set_printoptions(suppress=True)
     logger = StderrLogger()
     parser = ArgumentParser(description='Raytrace an index file generated by index.py')
     parser.add_argument('--camera-position', type=float, nargs=3, metavar=('x', 'y', 'z'), default=[0.0, 0.0, 0.0], help='The position of the camera.')
@@ -463,8 +510,6 @@ def main():
                 image.save(args.output, 'png', optimize=True, compress_level=9)
             if args.display:
                 image.show()
-
-    print(args)
     return 0
 
 if __name__ == '__main__':
