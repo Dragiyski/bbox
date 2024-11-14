@@ -1,6 +1,6 @@
 # Bounding Box Index
 
-Prototype for the bounding box index. Bounding box index is a development of algorithm (not an application or library). The purpose of this algorithm is:
+Prototype for the bounding box index. Bounding box index is a development of an algorithm (not an application or a library). The purpose of this algorithm is:
 
 * To be efficiently implementable on the GPU;
 * To generate an index for raytracing - generating two structures - a tree that organizes elements (a.k.a. up-structure) and a list of elements organized by types (a.k.a. down structure). Currently there will be two types of elements: triangles (to be displayed) and bounding boxes (to organize triangles);
