@@ -38,3 +38,42 @@ class ByteCounterStream:
         line = next(self._stream)
         self.bytes_read += len(line.encode(self._stream.encoding))
         return line
+
+def mat4_rotation_x(theta):
+    c = numpy.cos(theta)
+    s = numpy.sin(theta)
+    return numpy.array(
+        [
+            [1, 0, 0, 0],
+            [0, c, -s, 0],
+            [0, s, c, 0],
+            [0, 0, 0, 1]
+        ],
+        dtype=numpy.float64
+    )
+
+def mat4_rotation_y(theta):
+    c = numpy.cos(theta)
+    s = numpy.sin(theta)
+    return numpy.array(
+        [
+            [c, 0, s, 0],
+            [0, 1, 0, 0],
+            [-s, 0, c, 0],
+            [0, 0, 0, 1]
+        ],
+        dtype=numpy.float64
+    )
+
+def mat4_rotation_z(theta):
+    c = numpy.cos(theta)
+    s = numpy.sin(theta)
+    return numpy.array(
+        [
+            [c, -s, 0, 0],
+            [s, c, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ],
+        dtype=numpy.float64
+    )
