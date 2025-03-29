@@ -1,7 +1,7 @@
 import sys, numpy, pandas
 from index import MeshIndex
 from mesh import Mesh
-from util import Data, normalize
+from util import Data, normalize, open_file_for_writing
 from logger import NullLogger
 from PIL import Image
 
@@ -468,7 +468,7 @@ def main():
     raytrace_screen = raytrace_method.add_parser('screen', help='Raytrace an image with specified width and height.', description='Raytrace an entire image and store the result as PNG image. If the result is only displayed, it is stored as temporary file.')
     raytrace_screen.add_argument('width', type=int, help='The width of the screen/image')
     raytrace_screen.add_argument('height', type=int, help='The height of the screen/image')
-    raytrace_screen.add_argument('--output', '-o', type=lambda value: sys.stdout.buffer if value == '-' else open(Path(value).resolve(strict=False), 'wb'), default=None, help='The output file to write a PNG image.')
+    raytrace_screen.add_argument('--output', '-o', type=lambda value: sys.stdout.buffer if value == '-' else open_file_for_writing(Path(value).resolve(strict=False)), default=None, help='The output file to write a PNG image.')
     raytrace_screen.add_argument('--display', '-d', action='store_true', default=False, help='Display the raytraced image')
     raytrace_pixel = raytrace_method.add_parser('pixel', help='Raytrace a single pixel at (x, y) from image with specified width and height.', description='Raytrace a single pixel and display the result of intermediates for debugging.')
     raytrace_pixel.add_argument('x', type=int, help='The x coordinate of the pixel')

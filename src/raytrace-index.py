@@ -3,7 +3,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 from util import human_readable_bytes, ByteCounterStream
 from mesh import Mesh
-from util import normalize
+from util import normalize, quaternion_multiply, open_file_for_writing
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -34,8 +34,8 @@ class Raytracer:
         world_yaw_direction = -1.0 if args.world[0].isupper() else 1.0
         world_pitch_direction = -1.0 if args.world[1].isupper() else 1.0
         world_roll_direction = -1.0 if args.world[2].isupper() else 1.0
-        world_yaw_index = {v: i for i, v in enumerate('xyz')}[args.world[0].lower()]
-        world_pitch_index = {v: i for i, v in enumerate('xyz')}[args.world[1].lower()]
+        world_pitch_index = {v: i for i, v in enumerate('xyz')}[args.world[0].lower()]
+        world_yaw_index = {v: i for i, v in enumerate('xyz')}[args.world[1].lower()]
         world_roll_index = {v: i for i, v in enumerate('xyz')}[args.world[2].lower()]
 
         camera_direction = None
@@ -60,31 +60,38 @@ class Raytracer:
             camera_direction[world_roll_index] = world_roll_direction
         self.camera_direction = normalize(camera_direction)
 
-        self.yaw = numpy.arctan2(world_yaw_direction * self.camera_direction[world_yaw_index], world_roll_direction * self.camera_direction[world_roll_index])
-        self.pitch = numpy.arcsin(world_pitch_direction * self.camera_direction[world_pitch_index])
-
         world_yaw_axis = numpy.zeros((3,), dtype=numpy.float32)
         world_pitch_axis = numpy.zeros((3,), dtype=numpy.float32)
+        world_roll_axis = numpy.zeros((3,), dtype=numpy.float32)
         world_yaw_axis[world_yaw_index] = world_yaw_direction
         world_pitch_axis[world_pitch_index] = world_pitch_direction
+        world_roll_axis[world_roll_index] = world_roll_direction
 
-        view_yaw = numpy.cross(self.camera_direction, world_yaw_axis)
-        view_pitch_length = numpy.linalg.norm(view_yaw)
+        self.camera_yaw = numpy.arctan2(
+            numpy.dot(self.camera_direction, world_pitch_axis),
+            numpy.dot(self.camera_direction, world_roll_axis)
+        )
+        self.camera_pitch = numpy.arcsin(
+            numpy.dot(self.camera_direction, world_yaw_axis)
+        )
+
+        camera_pitch = numpy.cross(self.camera_direction, world_yaw_axis)
+        view_pitch_length = numpy.linalg.norm(camera_pitch)
         if view_pitch_length < numpy.finfo(numpy.float32).eps:
-            view_pitch = normalize(numpy.cross(world_pitch_axis, self.camera_direction))
-            view_yaw = normalize(numpy.cross(self.camera_direction, view_pitch))
+            camera_yaw = normalize(numpy.cross(world_pitch_axis, self.camera_direction))
+            camera_pitch = normalize(numpy.cross(self.camera_direction, camera_yaw))
         else:
-            view_yaw = view_yaw / view_pitch_length
-            view_pitch = normalize(numpy.cross(view_yaw, self.camera_direction))
-        self.view_pitch = view_pitch
-        self.view_yaw = view_yaw
+            camera_pitch = camera_pitch / view_pitch_length
+            camera_yaw = normalize(numpy.cross(camera_pitch, self.camera_direction))
+        self.camera_pitch_axis = camera_pitch
+        self.camera_yaw_axis = camera_yaw
 
         self.screen_diagonal = numpy.tan(self.field_of_view * 0.5)
         self.screen_height = self.screen_diagonal / numpy.sqrt(1 + self.aspect_ratio * self.aspect_ratio)
         self.screen_width = self.aspect_ratio * self.screen_height
 
-        self.world_screen_x = self.screen_width * self.view_pitch
-        self.world_screen_y = self.screen_height * self.view_yaw
+        self.world_screen_x = self.screen_width * self.camera_pitch_axis
+        self.world_screen_y = self.screen_height * self.camera_yaw_axis
         self.world_screen_center = self.camera_position + self.camera_direction
 
         view_pixels = numpy.moveaxis(numpy.mgrid[0:args.height, 0:args.width], 0, -1).astype(numpy.float32)
@@ -96,9 +103,48 @@ class Raytracer:
         world_pixels = self.world_screen_center + view_pixels[:, :, 0, None] * self.world_screen_y + view_pixels[:, :, 1, None] * self.world_screen_x
         self.primary_ray_direction = normalize(world_pixels - camera_position)
 
+    def compute_yaw_pitch(self, vectors):
+        base_shape = vectors.shape[:-1]
+        vector_list = vectors.reshape(-1, 3)
+
+        horizontal_projection = vector_list - numpy.einsum('ij,j->i', vector_list, self.camera_yaw_axis)[:, None] * self.camera_yaw_axis
+        horizontal_projection = normalize(horizontal_projection)
+
+        vertical_projection = vector_list - numpy.einsum('ij,j->i', vector_list, self.camera_pitch_axis)[:, None] * self.camera_pitch_axis
+        vertical_projection = normalize(vertical_projection)
+
+        yaw_cos = numpy.einsum('ij,j->i', horizontal_projection, self.camera_direction)
+        yaw_sin = numpy.einsum('ij,j->i', horizontal_projection, self.camera_pitch_axis)
+        yaw = numpy.arctan2(yaw_sin, yaw_cos)
+        pitch_cos = numpy.einsum('ij,j->i', vertical_projection, self.camera_direction)
+        pitch_sin = numpy.einsum('ij,j->i', vertical_projection, self.camera_yaw_axis)
+        pitch = numpy.arctan2(pitch_sin, pitch_cos)
+
+        return numpy.stack([yaw, pitch], axis=-1).reshape(*base_shape, 2)
+
     def image(self, args):
+        ray_yaw_pitch = self.compute_yaw_pitch(self.primary_ray_direction)
+        triangles = args.input.triangles.position
+        bbox = numpy.array([
+            triangles[1:].reshape(-1, 3).min(axis=0),
+            triangles[1:].reshape(-1, 3).max(axis=0)
+        ])
+        triangle_view_vectors = triangles[1:] - self.camera_position
+        # triangle_view_depth = numpy.linalg.norm(triangle_view_vectors, axis=-1)
+        triangle_view_vectors = normalize(triangle_view_vectors)
+        triangle_yaw_pitch = self.compute_yaw_pitch(triangle_view_vectors)
+        triangle_yaw_pitch_bbox = numpy.array([
+            triangle_yaw_pitch.reshape(-1, 2).min(axis=0),
+            triangle_yaw_pitch.reshape(-1, 2).max(axis=0)
+        ])
+
+        yaw_mask = numpy.logical_and(ray_yaw_pitch[:, :, 0] >= triangle_yaw_pitch_bbox[0, 0], ray_yaw_pitch[:, :, 0] <= triangle_yaw_pitch_bbox[1, 0])
+        pitch_mask = numpy.logical_and(ray_yaw_pitch[:, :, 1] >= triangle_yaw_pitch_bbox[0, 1], ray_yaw_pitch[:, :, 1] <= triangle_yaw_pitch_bbox[1, 1])
+        
         if args.output is not None or args.display:
-            color_buffer = self.primary_ray_direction * 0.5 + 0.5
+            color_buffer = numpy.zeros((args.height, args.width, 3), dtype=numpy.float32)
+            color_buffer[yaw_mask, 0] = 1.0
+            color_buffer[pitch_mask, 1] = 1.0
             color_buffer = (numpy.clip(color_buffer, 0.0, 1.0) * 255.0).astype(numpy.uint8)
             image = Image.fromarray(color_buffer)
             if args.output is not None:
@@ -121,7 +167,7 @@ def main():
     image_parser = subparsers.add_parser('image', help='Raytrace an image with specified width and height.')
     image_parser.add_argument('width', type=int, help='The width of the screen/image')
     image_parser.add_argument('height', type=int, help='The height of the screen/image')
-    image_parser.add_argument('--output', '-o', type=lambda value: sys.stdout.buffer if value == '-' else open(Path(value).resolve(strict=False), 'wb'), default=None, help='The output file to write a PNG image.')
+    image_parser.add_argument('--output', '-o', type=lambda value: sys.stdout.buffer if value == '-' else open_file_for_writing(Path(value).resolve(strict=False)), default=None, help='The output file to write a PNG image.')
     image_parser.add_argument('--display', '-d', action='store_true', default=False, help='Display the raytraced image')
 
     # pixel_parser = subparsers.add_parser('pixel', help='Raytrace a single pixel at (x, y) from image with specified width and height.')
